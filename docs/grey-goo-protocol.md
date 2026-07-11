@@ -90,6 +90,12 @@ The ID is redundant with the identity object on purpose. A planner must reject
 the record unless both representations agree and the parent disk GUID equals
 the device inventory's GPT disk GUID.
 
+Frankensargo's observed GPT disk GUID is the all-zero UUID in both header
+copies. The format above deliberately preserves that on-media fact; it does
+not make the partition ID globally unique. The live device scope must already
+match the explicit serial and eMMC CID, and the full partition tuple and
+inventory hash must still match, before a zero-parent-GUID ID is accepted.
+
 Artifact object IDs are their expanded raw content hashes:
 
 ```text

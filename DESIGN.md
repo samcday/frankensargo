@@ -20,6 +20,13 @@ Outer GPT names, types, geometry, and PARTUUIDs remain unchanged unless a later
 hardware test demonstrates that changing a type GUID is required. The LVM PV
 UUID and label inside an authorized donor are its takeover marker.
 
+Frankensargo's primary and backup GPT headers both carry the all-zero disk
+GUID. It remains part of the captured tuple, but contributes no uniqueness.
+No live executor may match this device or authorize a donor from the disk GUID
+alone: product, explicit fastboot serial, eMMC CID, full partition identity,
+and inventory hash are a conjunction. A `partition_id` with the zero parent
+GUID is meaningful only inside that already-verified device scope.
+
 The Android ABL-facing `boot_a` and `boot_b` partitions are never PV
 candidates. Neither are `dtbo`, `vbmeta`, modem/radio, persist, metadata, misc,
 GPT structures, or any partition consumed directly by earlier firmware.

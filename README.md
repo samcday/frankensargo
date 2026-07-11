@@ -175,6 +175,13 @@ bin/probe-fastboot --serial 99NAY1AZG1
 fastboot -s 99NAY1AZG1 boot "$PWD/out/pocketboot/pocketboot-sargo-lab.img"
 sudo modprobe cdc_acm
 tio /dev/ttyACM0
+
+adb -s 99NAY1AZG1 get-state
+adb -s 99NAY1AZG1 shell id
+adb -s 99NAY1AZG1 shell uname -a
+adb -s 99NAY1AZG1 shell cat /sys/block/mmcblk0/device/cid
+adb -s 99NAY1AZG1 shell lsblk
+adb -s 99NAY1AZG1 shell fdisk -l /dev/mmcblk0
 ```
 
 The verified 7,831,552-byte image had SHA-256
@@ -192,10 +199,31 @@ has no MBR signature, discovered no boot entries, and held in PocketBoot for
 UI or fastboot. Its eight UMS LUNs reported no media. No flash, erase, reboot,
 slot change, or block-device mutation was issued.
 
+The exact-serial ADB endpoint reported recovery mode and an unauthenticated
+root shell on Linux `7.1.2+`. The eMMC CID is
+`13014e53304a394b381011182ce76600`; the kernel's `lsblk` and
+`/proc/partitions` views independently confirmed one 61,071,360 KiB eMMC and
+72 GPT partitions. The large candidate observations are:
+
+| Name | Kernel observation | Size | PARTUUID |
+|---|---:|---:|---|
+| `system_a` | `mmcblk0p68` | 3,116 MiB | `e47e2a5d-0c65-4c57-a1c3-e4b6fdd5f56f` |
+| `system_b` | `mmcblk0p69` | 3,116 MiB | `803e64f5-4978-444b-9704-cb5fc2ed762c` |
+| `vendor_a` | `mmcblk0p70` | 768 MiB | `efb2cd24-9ee1-4193-b3a1-8c0cedd68f12` |
+| `vendor_b` | `mmcblk0p71` | 768 MiB | `2672dbbc-7d6c-46ee-9ad0-b9643c5a40cf` |
+| `userdata` | `mmcblk0p72` | 51,163 MiB | `db04e713-11c3-4d68-bec2-8cc483bd3891` |
+
+`fdisk` reported a valid GPT whose disk GUID is the all-zero UUID. Direct
+16-byte reads from both the primary and backup GPT headers confirmed that this
+is on disk, not a display bug. The disk GUID therefore contributes no device
+uniqueness on frankensargo: every inventory and authorization must bind it to
+the exact serial and eMMC CID. These observed kernel names and PARTUUIDs are
+evidence, not takeover authorization.
+
 The remaining sequence is deliberately incremental:
 
-1. capture eMMC CID, GPT signatures, LP metadata, and UART/pstore output;
-2. prove the complete inventory against a second read-only implementation;
+1. make the real manifest path explicitly test the zero-GUID plus CID binding;
+2. capture GPT type GUIDs, content signatures, LP metadata, and UART/pstore;
 3. prove SysRq reset and stock-fastboot recovery;
 4. export and verify the initial host-side bootstrap plan;
 5. explicitly authorize only `userdata` as the anchor PV;
