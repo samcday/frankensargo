@@ -252,6 +252,16 @@ The imports eventually unwound without a reboot. The exact topology, security
 changes, evidence, cleanup state, and phone-only retry controls are in the
 [Steam Deck USB/IP handover](docs/steamdeck-usbip-handover.md).
 
+The preferred Deck path was then proven on 2026-07-12 without USB/IP. A
+replacement data cable exposed exact-serial stock fastboot directly to the
+Deck; `fedora-latest` issued the transient PocketBoot boot and subsequently
+used its packaged `fastboot` and `adb` unprivileged against the gadget. Its
+physical `ttyUSB1` UART produced an unauthenticated root `/bin/sh` on
+`ttyMSM0`: `google,sargo`, serial `99NAY1AZG1`, and eMMC CID
+`13014e53304a394b381011182ce76600` all matched the USB/ADB inventory. The
+handover records the reproducible distrobox commands, stable topology path,
+and the deliberate physical-root-shell security boundary.
+
 The remaining sequence is deliberately incremental:
 
 1. map the snapshot into a real manifest with the zero-GUID plus CID binding;
