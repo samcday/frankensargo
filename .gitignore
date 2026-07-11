@@ -2,3 +2,5 @@
 out/
 lab/
 *.swp
+__pycache__/
+*.pyc

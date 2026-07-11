@@ -27,6 +27,14 @@ alone: product, explicit fastboot serial, eMMC CID, full partition identity,
 and inventory hash are a conjunction. A `partition_id` with the zero parent
 GUID is meaningful only inside that already-verified device scope.
 
+The CRC-valid backup GPT header on frankensargo points its entry-array LBA to
+the primary table at LBA 2. There is no independent backup partition-entry
+array. This layout is recorded rather than silently repaired; a raw off-device
+GPT capture and tested restore path are prerequisites to the first write.
+`bin/inventory-pocketboot` validates both headers, the shared entry-array CRC,
+every entry's geometry, and the kernel view, then emits the snapshot hash used
+by a future real manifest builder.
+
 The Android ABL-facing `boot_a` and `boot_b` partitions are never PV
 candidates. Neither are `dtbo`, `vbmeta`, modem/radio, persist, metadata, misc,
 GPT structures, or any partition consumed directly by earlier firmware.

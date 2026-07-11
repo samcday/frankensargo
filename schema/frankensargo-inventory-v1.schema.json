@@ -1,0 +1,346 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:frankensargo:inventory:1",
+  "title": "Frankensargo read-only hardware inventory v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "canonical_sha256",
+    "device",
+    "gpt",
+    "schema"
+  ],
+  "properties": {
+    "canonical_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "device": {
+      "$ref": "#/$defs/device"
+    },
+    "gpt": {
+      "$ref": "#/$defs/gpt"
+    },
+    "schema": {
+      "const": "org.frankensargo.inventory/1"
+    }
+  },
+  "$defs": {
+    "crc32": {
+      "type": "string",
+      "pattern": "^0x[0-9a-f]{8}$"
+    },
+    "decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adb_serial",
+        "adb_state",
+        "compatible",
+        "emmc",
+        "kernel_release",
+        "model",
+        "product"
+      ],
+      "properties": {
+        "adb_serial": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._:][A-Za-z0-9._:-]*$"
+        },
+        "adb_state": {
+          "const": "recovery"
+        },
+        "compatible": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "contains": {
+            "const": "google,sargo"
+          },
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "emmc": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cid",
+            "logical_sector_size",
+            "sector_count",
+            "size_bytes"
+          ],
+          "properties": {
+            "cid": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$"
+            },
+            "logical_sector_size": {
+              "enum": [
+                512,
+                1024,
+                2048,
+                4096
+              ]
+            },
+            "sector_count": {
+              "$ref": "#/$defs/decimal"
+            },
+            "size_bytes": {
+              "$ref": "#/$defs/decimal"
+            }
+          }
+        },
+        "kernel_release": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "product": {
+          "const": "sargo"
+        }
+      }
+    },
+    "gpt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backup_entry_array_independent",
+        "backup_entry_array_layout",
+        "backup_header",
+        "disk_guid",
+        "disk_guid_is_zero",
+        "entry_array_crc32",
+        "entry_array_sha256",
+        "entry_count",
+        "entry_size",
+        "first_usable_lba",
+        "last_usable_lba",
+        "partitions",
+        "primary_header"
+      ],
+      "properties": {
+        "backup_entry_array_independent": {
+          "type": "boolean"
+        },
+        "backup_entry_array_layout": {
+          "enum": [
+            "aliases-primary",
+            "independent"
+          ]
+        },
+        "backup_header": {
+          "$ref": "#/$defs/header"
+        },
+        "disk_guid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "disk_guid_is_zero": {
+          "type": "boolean"
+        },
+        "entry_array_crc32": {
+          "$ref": "#/$defs/crc32"
+        },
+        "entry_array_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "entry_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "entry_size": {
+          "type": "integer",
+          "minimum": 128,
+          "maximum": 4096,
+          "multipleOf": 8
+        },
+        "first_usable_lba": {
+          "$ref": "#/$defs/decimal"
+        },
+        "last_usable_lba": {
+          "$ref": "#/$defs/decimal"
+        },
+        "partitions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/partition"
+          }
+        },
+        "primary_header": {
+          "$ref": "#/$defs/header"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "backup_entry_array_layout": {
+                "const": "independent"
+              }
+            },
+            "required": [
+              "backup_entry_array_layout"
+            ]
+          },
+          "then": {
+            "properties": {
+              "backup_entry_array_independent": {
+                "const": true
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "backup_entry_array_independent": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "disk_guid": {
+                "const": "00000000-0000-0000-0000-000000000000"
+              }
+            },
+            "required": [
+              "disk_guid"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disk_guid_is_zero": {
+                "const": true
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "disk_guid_is_zero": {
+                "const": false
+              }
+            }
+          }
+        }
+      ]
+    },
+    "header": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backup_lba",
+        "current_lba",
+        "entry_array_lba",
+        "header_crc32",
+        "header_size",
+        "sector_sha256"
+      ],
+      "properties": {
+        "backup_lba": {
+          "$ref": "#/$defs/decimal"
+        },
+        "current_lba": {
+          "$ref": "#/$defs/decimal"
+        },
+        "entry_array_lba": {
+          "$ref": "#/$defs/decimal"
+        },
+        "header_crc32": {
+          "$ref": "#/$defs/crc32"
+        },
+        "header_size": {
+          "type": "integer",
+          "minimum": 92,
+          "maximum": 4096
+        },
+        "sector_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "partition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attributes",
+        "byte_size",
+        "kernel_node_observation",
+        "last_lba",
+        "name",
+        "number",
+        "partuuid",
+        "sector_count",
+        "start_lba",
+        "type_guid"
+      ],
+      "properties": {
+        "attributes": {
+          "type": "string",
+          "pattern": "^0x[0-9a-f]{16}$"
+        },
+        "byte_size": {
+          "$ref": "#/$defs/decimal"
+        },
+        "kernel_node_observation": {
+          "type": "string",
+          "pattern": "^mmcblk0p[1-9][0-9]*$"
+        },
+        "last_lba": {
+          "$ref": "#/$defs/decimal"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "partuuid": {
+          "$ref": "#/$defs/nonzeroUuid"
+        },
+        "sector_count": {
+          "$ref": "#/$defs/decimal"
+        },
+        "start_lba": {
+          "$ref": "#/$defs/decimal"
+        },
+        "type_guid": {
+          "$ref": "#/$defs/nonzeroUuid"
+        }
+      }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "nonzeroUuid": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/uuid"
+        },
+        {
+          "not": {
+            "const": "00000000-0000-0000-0000-000000000000"
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+"""Emit a deterministic, read-only frankensargo inventory over PocketBoot ADB."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import uuid
+import zlib
+from dataclasses import dataclass
+from typing import NoReturn
+
+
+SCHEMA = "org.frankensargo.inventory/1"
+DISK = "/dev/mmcblk0"
+SYS_BLOCK = "/sys/class/block/mmcblk0"
+SERIAL_RE = re.compile(r"^[A-Za-z0-9._:][A-Za-z0-9._:-]*$")
+CID_RE = re.compile(r"^[0-9a-f]{32}$")
+MAX_ENTRY_COUNT = 4096
+MAX_ENTRY_SIZE = 4096
+MAX_ENTRY_BYTES = 16 * 1024 * 1024
+GPT_HEADER = struct.Struct("<8sIIIIQQQQ16sQIII")
+
+
+class InventoryError(Exception):
+    """A safety or integrity check failed."""
+
+
+def fail(message: str) -> NoReturn:
+    raise InventoryError(message)
+
+
+def sha256(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def canonical_json(value: object) -> bytes:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return encoded.encode("utf-8") + b"\n"
+
+
+def parse_decimal(name: str, value: str, *, minimum: int, maximum: int) -> int:
+    if not re.fullmatch(r"0|[1-9][0-9]*", value):
+        fail(f"{name} is not canonical decimal: {value!r}")
+    parsed = int(value, 10)
+    if not minimum <= parsed <= maximum:
+        fail(f"{name} is outside the permitted range: {parsed}")
+    return parsed
+
+
+def decode_text(name: str, raw: bytes, *, strip_nul: bool = False) -> str:
+    if strip_nul:
+        raw = raw.rstrip(b"\x00\r\n")
+    else:
+        raw = raw.rstrip(b"\r\n")
+    raw = raw.replace(b"\r\n", b"\n")
+    try:
+        value = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(f"{name} is not UTF-8: {error}")
+    if not value:
+        fail(f"{name} is empty")
+    return value
+
+
+class Adb:
+    def __init__(self, serial: str) -> None:
+        executable = shutil.which(os.environ.get("ADB", "adb"))
+        if executable is None:
+            fail("adb is not installed")
+        self.executable = executable
+        self.serial = serial
+
+    def run(self, *arguments: str, timeout: int = 15) -> bytes:
+        command = [self.executable, "-s", self.serial, *arguments]
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            fail(f"adb command timed out: {' '.join(arguments)}")
+        except OSError as error:
+            fail(f"could not run adb: {error}")
+        if result.returncode != 0:
+            detail = result.stderr.replace(b"\r\n", b"\n").decode(
+                "utf-8", errors="replace"
+            ).strip()
+            suffix = f": {detail}" if detail else ""
+            fail(f"adb command failed: {' '.join(arguments)}{suffix}")
+        return result.stdout
+
+    def text(self, name: str, *arguments: str, strip_nul: bool = False) -> str:
+        return decode_text(name, self.run(*arguments), strip_nul=strip_nul)
+
+    def read_lbas(
+        self,
+        *,
+        sector_size: int,
+        disk_sectors: int,
+        start: int,
+        count: int,
+    ) -> bytes:
+        if start < 0 or count < 1 or start + count > disk_sectors:
+            fail(f"refusing out-of-range GPT read: start={start} count={count}")
+        byte_count = count * sector_size
+        if byte_count > MAX_ENTRY_BYTES + sector_size:
+            fail(f"refusing oversized GPT read: {byte_count} bytes")
+        # All interpolated values have already been range-checked integers. The
+        # fixed command has an input device only; it contains no output path.
+        script = (
+            f"exec /bin/dd if={DISK} bs={sector_size} "
+            f"skip={start} count={count} 2>/dev/null"
+        )
+        raw = self.run("exec-out", "/bin/sh", "-c", script, timeout=30)
+        if len(raw) != byte_count:
+            fail(
+                "short or contaminated GPT read: "
+                f"expected {byte_count} bytes, received {len(raw)}"
+            )
+        return raw
+
+
+@dataclass(frozen=True)
+class Header:
+    revision: int
+    header_size: int
+    header_crc32: int
+    current_lba: int
+    backup_lba: int
+    first_usable_lba: int
+    last_usable_lba: int
+    disk_guid: uuid.UUID
+    entry_lba: int
+    entry_count: int
+    entry_size: int
+    entry_crc32: int
+    sector_sha256: str
+
+
+def parse_header(
+    sector: bytes,
+    *,
+    role: str,
+    expected_lba: int,
+    sector_size: int,
+    disk_sectors: int,
+) -> Header:
+    if len(sector) != sector_size:
+        fail(f"{role} GPT header sector has the wrong size")
+    if len(sector) < GPT_HEADER.size:
+        fail(f"{role} GPT header is truncated")
+    (
+        signature,
+        revision,
+        header_size,
+        header_crc32,
+        reserved,
+        current_lba,
+        backup_lba,
+        first_usable_lba,
+        last_usable_lba,
+        disk_guid_raw,
+        entry_lba,
+        entry_count,
+        entry_size,
+        entry_crc32,
+    ) = GPT_HEADER.unpack_from(sector)
+    if signature != b"EFI PART":
+        fail(f"{role} GPT signature is missing")
+    if revision != 0x00010000:
+        fail(f"{role} GPT revision is unsupported: 0x{revision:08x}")
+    if not GPT_HEADER.size <= header_size <= sector_size:
+        fail(f"{role} GPT header size is invalid: {header_size}")
+    if reserved != 0:
+        fail(f"{role} GPT reserved field is nonzero")
+    if current_lba != expected_lba:
+        fail(
+            f"{role} GPT current LBA mismatch: expected {expected_lba}, "
+            f"found {current_lba}"
+        )
+    if backup_lba >= disk_sectors or backup_lba == current_lba:
+        fail(f"{role} GPT backup LBA is invalid: {backup_lba}")
+    if not 0 < first_usable_lba <= last_usable_lba < disk_sectors:
+        fail(f"{role} GPT usable range is invalid")
+    if not 0 < entry_lba < disk_sectors:
+        fail(f"{role} GPT entry-array LBA is invalid: {entry_lba}")
+    if not 1 <= entry_count <= MAX_ENTRY_COUNT:
+        fail(f"{role} GPT entry count is invalid: {entry_count}")
+    if not 128 <= entry_size <= MAX_ENTRY_SIZE or entry_size % 8 != 0:
+        fail(f"{role} GPT entry size is invalid: {entry_size}")
+    entry_bytes = entry_count * entry_size
+    if entry_bytes > MAX_ENTRY_BYTES:
+        fail(f"{role} GPT entry array exceeds the safety limit")
+
+    checked = bytearray(sector[:header_size])
+    checked[16:20] = b"\x00\x00\x00\x00"
+    observed_crc32 = zlib.crc32(checked) & 0xFFFFFFFF
+    if observed_crc32 != header_crc32:
+        fail(
+            f"{role} GPT header CRC mismatch: expected {header_crc32:08x}, "
+            f"found {observed_crc32:08x}"
+        )
+    return Header(
+        revision=revision,
+        header_size=header_size,
+        header_crc32=header_crc32,
+        current_lba=current_lba,
+        backup_lba=backup_lba,
+        first_usable_lba=first_usable_lba,
+        last_usable_lba=last_usable_lba,
+        disk_guid=uuid.UUID(bytes_le=disk_guid_raw),
+        entry_lba=entry_lba,
+        entry_count=entry_count,
+        entry_size=entry_size,
+        entry_crc32=entry_crc32,
+        sector_sha256=sha256(sector),
+    )
+
+
+def table_sector_count(header: Header, sector_size: int) -> int:
+    byte_count = header.entry_count * header.entry_size
+    return (byte_count + sector_size - 1) // sector_size
+
+
+def read_entry_array(
+    adb: Adb,
+    header: Header,
+    *,
+    sector_size: int,
+    disk_sectors: int,
+    role: str,
+) -> bytes:
+    sectors = table_sector_count(header, sector_size)
+    if header.entry_lba + sectors > disk_sectors:
+        fail(f"{role} GPT entry array extends beyond the disk")
+    raw = adb.read_lbas(
+        sector_size=sector_size,
+        disk_sectors=disk_sectors,
+        start=header.entry_lba,
+        count=sectors,
+    )
+    active = raw[: header.entry_count * header.entry_size]
+    observed_crc32 = zlib.crc32(active) & 0xFFFFFFFF
+    if observed_crc32 != header.entry_crc32:
+        fail(
+            f"{role} GPT entry-array CRC mismatch: "
+            f"expected {header.entry_crc32:08x}, found {observed_crc32:08x}"
+        )
+    return active
+
+
+def decode_partition_name(raw: bytes, number: int) -> str:
+    try:
+        decoded = raw.decode("utf-16-le")
+    except UnicodeDecodeError as error:
+        fail(f"GPT partition {number} has an invalid UTF-16 name: {error}")
+    name = decoded.split("\x00", 1)[0]
+    if not name:
+        fail(f"GPT partition {number} has an empty name")
+    if any(ord(character) < 0x20 for character in name):
+        fail(f"GPT partition {number} name contains a control character")
+    return name
+
+
+def parse_partitions(header: Header, entries: bytes, sector_size: int) -> list[dict]:
+    partitions: list[dict] = []
+    seen_guids: set[str] = set()
+    seen_names: set[str] = set()
+    geometry: list[tuple[int, int, int]] = []
+    for index in range(header.entry_count):
+        number = index + 1
+        start = index * header.entry_size
+        entry = entries[start : start + header.entry_size]
+        type_raw = entry[0:16]
+        if type_raw == bytes(16):
+            if any(entry[16:]):
+                fail(f"unused GPT entry {number} contains nonzero data")
+            continue
+        unique_raw = entry[16:32]
+        if unique_raw == bytes(16):
+            fail(f"GPT partition {number} has an all-zero PARTUUID")
+        first_lba, last_lba, attributes = struct.unpack_from("<QQQ", entry, 32)
+        if not header.first_usable_lba <= first_lba <= last_lba <= header.last_usable_lba:
+            fail(f"GPT partition {number} lies outside the usable range")
+        type_guid = str(uuid.UUID(bytes_le=type_raw))
+        partuuid = str(uuid.UUID(bytes_le=unique_raw))
+        name = decode_partition_name(entry[56:128], number)
+        if partuuid in seen_guids:
+            fail(f"duplicate PARTUUID in GPT entry {number}: {partuuid}")
+        if name in seen_names:
+            fail(f"duplicate GPT partition name in entry {number}: {name}")
+        seen_guids.add(partuuid)
+        seen_names.add(name)
+        sectors = last_lba - first_lba + 1
+        geometry.append((first_lba, last_lba, number))
+        partitions.append(
+            {
+                "attributes": f"0x{attributes:016x}",
+                "byte_size": str(sectors * sector_size),
+                "kernel_node_observation": f"mmcblk0p{number}",
+                "last_lba": str(last_lba),
+                "name": name,
+                "number": number,
+                "partuuid": partuuid,
+                "sector_count": str(sectors),
+                "start_lba": str(first_lba),
+                "type_guid": type_guid,
+            }
+        )
+    geometry.sort()
+    for previous, current in zip(geometry, geometry[1:]):
+        if current[0] <= previous[1]:
+            fail(f"GPT partitions {previous[2]} and {current[2]} overlap")
+    if not partitions:
+        fail("GPT contains no partitions")
+    return partitions
+
+
+def parse_uevents(raw: bytes, expected_count: int) -> list[dict[str, str]]:
+    try:
+        text = raw.replace(b"\r\n", b"\n").decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        fail(f"kernel uevent stream is not UTF-8: {error}")
+    chunks = text.split("MAJOR=")
+    if chunks[0].strip():
+        fail("kernel uevent stream has an unexpected prefix")
+    records: list[dict[str, str]] = []
+    for chunk in chunks[1:]:
+        record: dict[str, str] = {}
+        for line in ("MAJOR=" + chunk).splitlines():
+            if not line:
+                continue
+            key, separator, value = line.partition("=")
+            if not separator or key in record:
+                fail("kernel uevent stream is malformed")
+            record[key] = value
+        records.append(record)
+    if len(records) != expected_count:
+        fail(
+            "kernel uevent count does not match GPT: "
+            f"expected {expected_count}, found {len(records)}"
+        )
+    return records
+
+
+def parse_decimal_lines(name: str, raw: bytes, expected_count: int) -> list[int]:
+    try:
+        text = raw.replace(b"\r\n", b"\n").decode("ascii", errors="strict")
+    except UnicodeDecodeError as error:
+        fail(f"{name} stream is not ASCII: {error}")
+    lines = [line for line in text.splitlines() if line]
+    if len(lines) != expected_count:
+        fail(f"{name} count does not match GPT")
+    return [
+        parse_decimal(f"{name} value", line, minimum=0, maximum=(1 << 63) - 1)
+        for line in lines
+    ]
+
+
+def verify_kernel_view(adb: Adb, partitions: list[dict], sector_size: int) -> None:
+    numbers = [partition["number"] for partition in partitions]
+    uevent_paths = [f"{SYS_BLOCK}p{number}/uevent" for number in numbers]
+    start_paths = [f"{SYS_BLOCK}p{number}/start" for number in numbers]
+    size_paths = [f"{SYS_BLOCK}p{number}/size" for number in numbers]
+    uevents = parse_uevents(
+        adb.run("shell", "/bin/cat", *uevent_paths), len(partitions)
+    )
+    starts = parse_decimal_lines(
+        "kernel partition start",
+        adb.run("shell", "/bin/cat", *start_paths),
+        len(partitions),
+    )
+    sizes = parse_decimal_lines(
+        "kernel partition size",
+        adb.run("shell", "/bin/cat", *size_paths),
+        len(partitions),
+    )
+    for partition, uevent, start, size in zip(partitions, uevents, starts, sizes):
+        expected = {
+            "DEVNAME": partition["kernel_node_observation"],
+            "DEVTYPE": "partition",
+            "PARTN": str(partition["number"]),
+            "PARTNAME": partition["name"],
+            "PARTUUID": partition["partuuid"],
+        }
+        for key, value in expected.items():
+            if uevent.get(key) != value:
+                fail(
+                    f"kernel/GPT mismatch for partition {partition['number']} "
+                    f"field {key}: expected {value!r}, found {uevent.get(key)!r}"
+                )
+        expected_start = int(partition["start_lba"]) * sector_size // 512
+        expected_size = int(partition["sector_count"]) * sector_size // 512
+        if start != expected_start:
+            fail(f"kernel/GPT start mismatch for partition {partition['number']}")
+        if size != expected_size:
+            fail(f"kernel/GPT size mismatch for partition {partition['number']}")
+
+
+def header_json(header: Header) -> dict:
+    return {
+        "backup_lba": str(header.backup_lba),
+        "current_lba": str(header.current_lba),
+        "entry_array_lba": str(header.entry_lba),
+        "header_crc32": f"0x{header.header_crc32:08x}",
+        "header_size": header.header_size,
+        "sector_sha256": header.sector_sha256,
+    }
+
+
+def collect(serial: str) -> dict:
+    adb = Adb(serial)
+    state = adb.text("ADB state", "get-state")
+    if state != "recovery":
+        fail(f"refusing unexpected ADB state: {state!r}")
+    reported_serial = adb.text("ADB serial", "get-serialno")
+    if reported_serial != serial:
+        fail(
+            f"ADB serial does not match requested serial: "
+            f"requested {serial!r}, reported {reported_serial!r}"
+        )
+    identity = adb.text("ADB shell identity", "shell", "/usr/bin/id")
+    if not re.search(r"(?:^|\s)uid=0(?:\([^)]*\))?(?:\s|$)", identity):
+        fail("PocketBoot ADB shell is not uid 0")
+
+    compatible_raw = adb.run("shell", "/bin/cat", "/proc/device-tree/compatible")
+    compatible = [
+        decode_text("device-tree compatible", item)
+        for item in compatible_raw.rstrip(b"\x00\r\n").split(b"\x00")
+        if item
+    ]
+    if "google,sargo" not in compatible:
+        fail("refusing a device without google,sargo compatibility")
+    model = adb.text(
+        "device-tree model",
+        "shell",
+        "/bin/cat",
+        "/proc/device-tree/model",
+        strip_nul=True,
+    )
+    kernel_release = adb.text("kernel release", "shell", "/bin/uname", "-r")
+    cid = adb.text(
+        "eMMC CID", "shell", "/bin/cat", "/sys/block/mmcblk0/device/cid"
+    ).lower()
+    if not CID_RE.fullmatch(cid):
+        fail(f"eMMC CID is malformed: {cid!r}")
+    sector_size = parse_decimal(
+        "logical sector size",
+        adb.text(
+            "logical sector size",
+            "shell",
+            "/bin/cat",
+            f"{SYS_BLOCK}/queue/logical_block_size",
+        ),
+        minimum=512,
+        maximum=4096,
+    )
+    if sector_size not in (512, 1024, 2048, 4096):
+        fail(f"logical sector size is not a supported power of two: {sector_size}")
+    sysfs_sectors_512 = parse_decimal(
+        "sysfs disk size",
+        adb.text("sysfs disk size", "shell", "/bin/cat", f"{SYS_BLOCK}/size"),
+        minimum=68,
+        maximum=(1 << 63) - 1,
+    )
+    disk_bytes = sysfs_sectors_512 * 512
+    if disk_bytes % sector_size != 0:
+        fail(
+            "sysfs disk size is not divisible by the logical sector size: "
+            f"bytes={disk_bytes} logical_sector_size={sector_size}"
+        )
+    disk_sectors = disk_bytes // sector_size
+    if disk_sectors < 68:
+        fail(f"disk has too few logical sectors for GPT: {disk_sectors}")
+
+    primary_sector = adb.read_lbas(
+        sector_size=sector_size,
+        disk_sectors=disk_sectors,
+        start=1,
+        count=1,
+    )
+    primary = parse_header(
+        primary_sector,
+        role="primary",
+        expected_lba=1,
+        sector_size=sector_size,
+        disk_sectors=disk_sectors,
+    )
+    if primary.backup_lba != disk_sectors - 1:
+        fail(
+            "backup GPT header is not at the final logical LBA: "
+            f"expected {disk_sectors - 1}, found {primary.backup_lba}"
+        )
+    if primary.last_usable_lba >= primary.backup_lba:
+        fail("GPT usable range overlaps the backup header")
+    primary_sectors = table_sector_count(primary, sector_size)
+    if primary.entry_lba <= primary.current_lba:
+        fail("primary GPT entry array does not follow the header")
+    if primary.entry_lba + primary_sectors - 1 >= primary.first_usable_lba:
+        fail("primary GPT entry array overlaps the usable range")
+    primary_entries = read_entry_array(
+        adb,
+        primary,
+        sector_size=sector_size,
+        disk_sectors=disk_sectors,
+        role="primary",
+    )
+
+    backup_sector = adb.read_lbas(
+        sector_size=sector_size,
+        disk_sectors=disk_sectors,
+        start=primary.backup_lba,
+        count=1,
+    )
+    backup = parse_header(
+        backup_sector,
+        role="backup",
+        expected_lba=primary.backup_lba,
+        sector_size=sector_size,
+        disk_sectors=disk_sectors,
+    )
+    if backup.backup_lba != primary.current_lba:
+        fail("backup GPT does not point back to the primary header")
+    comparable = (
+        "revision",
+        "header_size",
+        "first_usable_lba",
+        "last_usable_lba",
+        "disk_guid",
+        "entry_count",
+        "entry_size",
+        "entry_crc32",
+    )
+    for field in comparable:
+        if getattr(primary, field) != getattr(backup, field):
+            fail(f"primary/backup GPT mismatch in {field}")
+    backup_sectors = table_sector_count(backup, sector_size)
+    if backup.entry_lba == primary.entry_lba:
+        backup_entry_array_layout = "aliases-primary"
+    elif backup.entry_lba > backup.last_usable_lba:
+        if backup.entry_lba + backup_sectors != backup.current_lba:
+            fail("independent backup GPT entry array is not adjacent to its header")
+        backup_entry_array_layout = "independent"
+    else:
+        fail(
+            "backup GPT entry array has an unsafe layout: "
+            f"entry_lba={backup.entry_lba} "
+            f"last_usable_lba={backup.last_usable_lba}"
+        )
+    backup_entries = read_entry_array(
+        adb,
+        backup,
+        sector_size=sector_size,
+        disk_sectors=disk_sectors,
+        role="backup",
+    )
+    if backup_entries != primary_entries:
+        fail("primary and backup GPT entry arrays differ")
+
+    partitions = parse_partitions(primary, primary_entries, sector_size)
+    verify_kernel_view(adb, partitions, sector_size)
+
+    payload = {
+        "device": {
+            "adb_serial": serial,
+            "adb_state": state,
+            "compatible": compatible,
+            "emmc": {
+                "cid": cid,
+                "logical_sector_size": sector_size,
+                "sector_count": str(disk_sectors),
+                "size_bytes": str(disk_sectors * sector_size),
+            },
+            "kernel_release": kernel_release,
+            "model": model,
+            "product": "sargo",
+        },
+        "gpt": {
+            "backup_entry_array_independent": (
+                backup_entry_array_layout == "independent"
+            ),
+            "backup_entry_array_layout": backup_entry_array_layout,
+            "backup_header": header_json(backup),
+            "disk_guid": str(primary.disk_guid),
+            "disk_guid_is_zero": primary.disk_guid.int == 0,
+            "entry_array_crc32": f"0x{primary.entry_crc32:08x}",
+            "entry_array_sha256": sha256(primary_entries),
+            "entry_count": primary.entry_count,
+            "entry_size": primary.entry_size,
+            "first_usable_lba": str(primary.first_usable_lba),
+            "last_usable_lba": str(primary.last_usable_lba),
+            "partitions": partitions,
+            "primary_header": header_json(primary),
+        },
+        "schema": SCHEMA,
+    }
+    result = dict(payload)
+    result["canonical_sha256"] = sha256(canonical_json(payload))
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Read PocketBoot's fixed sargo/eMMC identity and GPT through one "
+            "explicitly named ADB transport. No write command is issued."
+        )
+    )
+    parser.add_argument("--serial", required=True, help="exact PocketBoot ADB serial")
+    arguments = parser.parse_args()
+    if not SERIAL_RE.fullmatch(arguments.serial) or arguments.serial.startswith("-"):
+        parser.error("--serial contains unsafe characters")
+    try:
+        inventory = collect(arguments.serial)
+    except InventoryError as error:
+        print(f"inventory-pocketboot: {error}", file=sys.stderr)
+        return 1
+    json.dump(inventory, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        raise SystemExit(1)

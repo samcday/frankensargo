@@ -16,6 +16,10 @@ The authoritative machine-readable files are:
   the pragmatic structural schema;
 - [`grey-goo-manifest-v1.example.json`](../examples/grey-goo-manifest-v1.example.json),
   a valid but entirely synthetic manifest;
+- [`frankensargo-inventory-v1.schema.json`](../schema/frankensargo-inventory-v1.schema.json)
+  and [`inventory-pocketboot`](../bin/inventory-pocketboot), the structural
+  schema and deterministic read-only evidence collector (stored snapshots
+  still require canonical-hash and semantic/device-binding verification);
 - [`plan-discovery`](../target/plan-discovery), the host-only two-stage
   outer-LVM discovery validator; and
 - [`plan-absorb`](../target/plan-absorb), the host-only semantic validator and
