@@ -166,19 +166,36 @@ That downstream attempt exposed a sustained USB bulk-OUT failure in
 isolation matrix, xHCI/usbmon evidence, cleanup state, and next controls are in
 the [dev-sargo USB host-mode failure handover](docs/dev-sargo-usb-host-failure-handover.md).
 
-Discovery on frankensargo starts read-only and with its explicit serial. At the
-2026-07-11 handover it was connected directly to the desktop for the next
-control:
+Discovery on frankensargo starts read-only and with its explicit serial. The
+first direct-desktop transient boot passed on 2026-07-11:
 
 ```sh
 bin/probe-fastboot --serial 99NAY1AZG1
+(cd out/pocketboot && sha256sum -c pocketboot-sargo-lab.img.sha256)
+fastboot -s 99NAY1AZG1 boot "$PWD/out/pocketboot/pocketboot-sargo-lab.img"
+sudo modprobe cdc_acm
+tio /dev/ttyACM0
 ```
 
-Then the sequence is deliberately incremental:
+The verified 7,831,552-byte image had SHA-256
+`98983cc3331de0f08d6a578b89f87f2b5003607e30cb7ae5d218eb56612d48a6`.
+PocketBoot displayed its UI and accepted touch input. It re-enumerated as USB
+`1d6b:0104`, product `pocketboot`, with the same serial and CDC ACM, fastboot,
+ADB, and mass-storage functions. The desktop needed `cdc_acm` loaded before
+`ttyACM0` appeared.
 
-1. transiently boot the pinned generic lab image;
-2. capture serial, eMMC CID, complete GPT, slots, signatures, LP metadata, and
-   UART/pstore output;
+The ACM log showed all eight CPUs, the 59,640 MiB eMMC, and its GPT, including
+3,116 MiB each for `system_a` and `system_b`, 768 MiB each for `vendor_a` and
+`vendor_b`, and 51,163 MiB for `userdata`. The generic artifact intentionally
+had no VG binding, rejected userdata as a legacy nested-MBR source because it
+has no MBR signature, discovered no boot entries, and held in PocketBoot for
+UI or fastboot. Its eight UMS LUNs reported no media. No flash, erase, reboot,
+slot change, or block-device mutation was issued.
+
+The remaining sequence is deliberately incremental:
+
+1. capture eMMC CID, GPT signatures, LP metadata, and UART/pstore output;
+2. prove the complete inventory against a second read-only implementation;
 3. prove SysRq reset and stock-fastboot recovery;
 4. export and verify the initial host-side bootstrap plan;
 5. explicitly authorize only `userdata` as the anchor PV;
