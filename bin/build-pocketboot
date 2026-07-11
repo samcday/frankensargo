@@ -1,0 +1,177 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck disable=SC1091
+. "$ROOT/config/sources.lock"
+# shellcheck disable=SC1091
+. "$ROOT/lib/patchset.sh"
+
+kernel_tree=$SDM670_KERNEL_LOCAL
+source_dir=$ROOT/.work/pocketboot
+output_dir=$ROOT/out/pocketboot
+prepare_only=0
+
+usage() {
+    cat <<'EOF'
+usage: bin/build-pocketboot [--kernel-tree PATH] [--source-dir PATH] [--output-dir PATH] [--prepare-only]
+
+Build the pinned sargo PocketBoot lab image. This builds files only; it never
+enumerates, boots, flashes, or otherwise communicates with a phone.
+
+--prepare-only repairs/prepares the pinned source tree and exits before the
+large kernel build.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --kernel-tree)
+            [ "$#" -ge 2 ] || { echo "build-pocketboot: --kernel-tree needs a path" >&2; exit 2; }
+            kernel_tree=$2
+            shift 2
+            ;;
+        --source-dir)
+            [ "$#" -ge 2 ] || { echo "build-pocketboot: --source-dir needs a path" >&2; exit 2; }
+            source_dir=$2
+            shift 2
+            ;;
+        --output-dir)
+            [ "$#" -ge 2 ] || { echo "build-pocketboot: --output-dir needs a path" >&2; exit 2; }
+            output_dir=$2
+            shift 2
+            ;;
+        --prepare-only)
+            prepare_only=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "build-pocketboot: unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+for command in git cargo make mktemp sha256sum; do
+    command -v "$command" >/dev/null 2>&1 || {
+        echo "build-pocketboot: missing command: $command" >&2
+        exit 1
+    }
+done
+
+git -C "$kernel_tree" rev-parse --git-dir >/dev/null 2>&1 || {
+    echo "build-pocketboot: kernel tree is not a Git checkout: $kernel_tree" >&2
+    exit 1
+}
+
+kernel_head=$(git -C "$kernel_tree" rev-parse HEAD)
+[ "$kernel_head" = "$SDM670_KERNEL_REV" ] || {
+    echo "build-pocketboot: refusing unpinned kernel tree" >&2
+    echo "  expected: $SDM670_KERNEL_REV" >&2
+    echo "  actual:   $kernel_head" >&2
+    exit 1
+}
+
+mkdir -p "$(dirname -- "$source_dir")" "$output_dir"
+if ! git -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then
+    git clone --filter=blob:none --no-checkout "$POCKETBOOT_URL" "$source_dir"
+fi
+
+origin_url=$(git -C "$source_dir" remote get-url origin)
+[ "$origin_url" = "$POCKETBOOT_URL" ] || {
+    echo "build-pocketboot: unexpected origin in $source_dir: $origin_url" >&2
+    exit 1
+}
+
+if ! git -C "$source_dir" cat-file -e "$POCKETBOOT_REV^{commit}" 2>/dev/null; then
+    git -C "$source_dir" fetch --depth=1 origin "$POCKETBOOT_REV"
+fi
+
+# Repair an interrupted checkout that staged deletion of the entire index.
+# Restore only the index first; any differing worktree contents remain visible
+# and are rejected by the normal dirty-tree check below.
+staged_deletions=$(git -C "$source_dir" diff --cached --name-only --diff-filter=D)
+staged_nondeletions=$(git -C "$source_dir" diff --cached --name-only --diff-filter=ACMRTUXB)
+if [ -n "$staged_deletions" ] && [ -z "$staged_nondeletions" ]; then
+    git -C "$source_dir" restore --source="$POCKETBOOT_REV" --staged -- .
+fi
+
+# A cancelled partial clone can leave a valid index and object database with an
+# empty worktree. Restore only when every tracked difference is a missing file
+# and there are no untracked files; unexpected user changes still stop here.
+if [ ! -f "$source_dir/Cargo.toml" ]; then
+    nondeletions=$(git -C "$source_dir" diff --name-only --diff-filter=ACMRTUXB)
+    staged_nondeletions=$(git -C "$source_dir" diff --cached --name-only --diff-filter=ACMRTUXB)
+    untracked=$(git -C "$source_dir" ls-files --others --exclude-standard)
+    if [ -z "$nondeletions" ] && [ -z "$staged_nondeletions" ] && [ -z "$untracked" ]; then
+        git -C "$source_dir" restore --source="$POCKETBOOT_REV" --staged --worktree -- .
+    else
+        echo "build-pocketboot: incomplete source has unexpected changes: $source_dir" >&2
+        exit 1
+    fi
+fi
+
+source_head=$(git -C "$source_dir" rev-parse HEAD)
+if [ "$source_head" != "$POCKETBOOT_REV" ]; then
+    source_state=$(git -C "$source_dir" status --porcelain --untracked-files=all)
+    [ -z "$source_state" ] || {
+        echo "build-pocketboot: wrong revision with local changes: $source_head" >&2
+        exit 1
+    }
+    git -C "$source_dir" checkout --detach "$POCKETBOOT_REV"
+    source_head=$POCKETBOOT_REV
+fi
+
+patchset_verify_or_apply "$source_dir" "$POCKETBOOT_REV" \
+    "$ROOT/patches/pocketboot" || {
+    echo "build-pocketboot: source does not match the pinned patch stack: $source_dir" >&2
+    exit 1
+}
+source_tree=$(patchset_worktree_tree "$source_dir" "$POCKETBOOT_REV")
+
+if [ "$prepare_only" -eq 1 ]; then
+    printf 'prepared %s at %s\npatched tree %s\n' \
+        "$source_dir" "$source_head" "$source_tree"
+    exit 0
+fi
+
+artifact=$output_dir/pocketboot-sargo-lab.img
+tmp_artifact=$output_dir/.pocketboot-sargo-lab.img.tmp
+rm -f "$tmp_artifact"
+
+(
+    cd "$source_dir"
+    cargo xtask build qcom/sdm670-google-sargo "$kernel_tree" --output "$tmp_artifact"
+)
+
+[ -s "$tmp_artifact" ] || {
+    echo "build-pocketboot: build produced no boot image" >&2
+    exit 1
+}
+mv -f "$tmp_artifact" "$artifact"
+
+hash=$(sha256sum "$artifact")
+hash=${hash%% *}
+printf '%s  %s\n' "$hash" "$(basename -- "$artifact")" >"$artifact.sha256"
+{
+    printf 'profile=lab\n'
+    printf 'pocketboot_url=%s\n' "$POCKETBOOT_URL"
+    printf 'pocketboot_rev=%s\n' "$POCKETBOOT_REV"
+    printf 'pocketboot_patched_tree=%s\n' "$source_tree"
+    for patch in "$ROOT"/patches/pocketboot/*.patch; do
+        patch_hash=$(sha256sum "$patch")
+        patch_hash=${patch_hash%% *}
+        printf 'patch=%s sha256=%s\n' "${patch##*/}" "$patch_hash"
+    done
+    printf 'kernel_url=%s\n' "$SDM670_KERNEL_URL"
+    printf 'kernel_rev=%s\n' "$SDM670_KERNEL_REV"
+    printf 'sha256=%s\n' "$hash"
+    printf 'built_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} >"$artifact.provenance"
+
+printf 'built %s\nsha256 %s\n' "$artifact" "$hash"

@@ -1,0 +1,655 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:pocketboot:grey-goo:manifest:1",
+  "title": "PocketBoot grey-goo manifest v1",
+  "description": "Host-verifiable inventory and takeover state for one device. Cross-record and arithmetic invariants are enforced by the host planners, not by this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generation",
+    "previous_sha256",
+    "device",
+    "capsule_binding",
+    "lvm",
+    "partitions",
+    "objects",
+    "firmware_gate",
+    "active_operation"
+  ],
+  "properties": {
+    "schema": {
+      "const": "org.pocketboot.greygoo/1"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "previous_sha256": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "device": {
+      "$ref": "#/$defs/device"
+    },
+    "capsule_binding": {
+      "$ref": "#/$defs/capsuleBinding"
+    },
+    "lvm": {
+      "$ref": "#/$defs/lvm"
+    },
+    "partitions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/partition"
+      }
+    },
+    "objects": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/object"
+      }
+    },
+    "firmware_gate": {
+      "$ref": "#/$defs/firmwareGate"
+    },
+    "active_operation": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/activeOperation"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "lvmUuid": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9]{6}(-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}$"
+    },
+    "decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,17})$"
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uuid",
+        "product",
+        "fastboot_serial",
+        "emmc_cid",
+        "gpt_disk_guid",
+        "inventory_sha256"
+      ],
+      "properties": {
+        "uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "product": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fastboot_serial": {
+          "type": "string",
+          "minLength": 1
+        },
+        "emmc_cid": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "gpt_disk_guid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "inventory_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "capsuleBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "anchor_partuuid",
+        "vg_uuid"
+      ],
+      "properties": {
+        "anchor_partuuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "vg_uuid": {
+          "$ref": "#/$defs/lvmUuid"
+        }
+      }
+    },
+    "allowedPv": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "partition_id",
+        "partuuid",
+        "pv_uuid"
+      ],
+      "properties": {
+        "partition_id": {
+          "type": "string",
+          "pattern": "^gpt:[0-9a-f-]{36}/[0-9a-f-]{36}$"
+        },
+        "partuuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "pv_uuid": {
+          "$ref": "#/$defs/lvmUuid"
+        }
+      }
+    },
+    "lvm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vg_name",
+        "vg_uuid",
+        "vg_seqno",
+        "anchor_pv_uuid",
+        "allowed_pvs",
+        "thin_pool"
+      ],
+      "properties": {
+        "vg_name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_+.-]+$"
+        },
+        "vg_uuid": {
+          "$ref": "#/$defs/lvmUuid"
+        },
+        "vg_seqno": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "anchor_pv_uuid": {
+          "$ref": "#/$defs/lvmUuid"
+        },
+        "allowed_pvs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/allowedPv"
+          }
+        },
+        "thin_pool": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "lv_uuid",
+            "chunk_bytes",
+            "transaction_id",
+            "metadata_lv_uuid",
+            "metadata_spare_lv_uuid"
+          ],
+          "properties": {
+            "lv_uuid": {
+              "$ref": "#/$defs/lvmUuid"
+            },
+            "chunk_bytes": {
+              "$ref": "#/$defs/decimal"
+            },
+            "transaction_id": {
+              "$ref": "#/$defs/decimal"
+            },
+            "metadata_lv_uuid": {
+              "$ref": "#/$defs/lvmUuid"
+            },
+            "metadata_spare_lv_uuid": {
+              "$ref": "#/$defs/lvmUuid"
+            }
+          }
+        }
+      }
+    },
+    "partition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "classification",
+        "firmware_gate_required",
+        "lp_extent_gate",
+        "identity",
+        "geometry",
+        "raw",
+        "archive_object_id",
+        "capacity",
+        "takeover"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^gpt:[0-9a-f-]{36}/[0-9a-f-]{36}$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "classification": {
+          "enum": [
+            "anchor",
+            "candidate",
+            "forbidden",
+            "member"
+          ]
+        },
+        "firmware_gate_required": {
+          "type": "boolean"
+        },
+        "lp_extent_gate": {
+          "$ref": "#/$defs/lpExtentGate"
+        },
+        "identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "immutable",
+            "parent_disk_guid",
+            "partuuid",
+            "partlabel"
+          ],
+          "properties": {
+            "immutable": {
+              "const": true
+            },
+            "parent_disk_guid": {
+              "$ref": "#/$defs/uuid"
+            },
+            "partuuid": {
+              "$ref": "#/$defs/uuid"
+            },
+            "partlabel": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "geometry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "immutable",
+            "start_lba",
+            "sectors",
+            "logical_sector_bytes"
+          ],
+          "properties": {
+            "immutable": {
+              "const": true
+            },
+            "start_lba": {
+              "$ref": "#/$defs/decimal"
+            },
+            "sectors": {
+              "$ref": "#/$defs/decimal"
+            },
+            "logical_sector_bytes": {
+              "enum": [
+                512,
+                4096
+              ]
+            }
+          }
+        },
+        "raw": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "immutable",
+            "bytes",
+            "sha256"
+          ],
+          "properties": {
+            "immutable": {
+              "const": true
+            },
+            "bytes": {
+              "$ref": "#/$defs/decimal"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        "archive_object_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "capacity": {
+          "$ref": "#/$defs/capacity"
+        },
+        "takeover": {
+          "$ref": "#/$defs/takeover"
+        }
+      }
+    },
+    "lpExtentGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "status",
+        "metadata_sha256",
+        "extent_graph_sha256",
+        "all_touching_extents_archived",
+        "archive_mappings_verified"
+      ],
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "not-required",
+            "pending",
+            "satisfied"
+          ]
+        },
+        "metadata_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "extent_graph_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "all_touching_extents_archived": {
+          "type": "boolean"
+        },
+        "archive_mappings_verified": {
+          "type": "boolean"
+        }
+      }
+    },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "donor_bytes",
+        "retained_allocated_bytes",
+        "metadata_growth_bytes",
+        "reserve_bytes",
+        "conservative_net_bytes"
+      ],
+      "properties": {
+        "donor_bytes": {
+          "$ref": "#/$defs/decimal"
+        },
+        "retained_allocated_bytes": {
+          "$ref": "#/$defs/decimal"
+        },
+        "metadata_growth_bytes": {
+          "$ref": "#/$defs/decimal"
+        },
+        "reserve_bytes": {
+          "$ref": "#/$defs/decimal"
+        },
+        "conservative_net_bytes": {
+          "$ref": "#/$defs/decimal"
+        }
+      }
+    },
+    "takeover": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "planned_pv_uuid",
+        "planned_pv_uuid_immutable",
+        "binding_sha256"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "discovered",
+            "copying",
+            "archive-verified",
+            "ready",
+            "authorized",
+            "absorb-intent",
+            "pv-present",
+            "vg-member-fenced",
+            "capacity-released",
+            "absorbed",
+            "quarantined"
+          ]
+        },
+        "planned_pv_uuid": {
+          "$ref": "#/$defs/lvmUuid"
+        },
+        "planned_pv_uuid_immutable": {
+          "const": true
+        },
+        "binding_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "object": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "bytes",
+        "source_partition_id",
+        "immutable",
+        "verification",
+        "off_device_copies"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "kind": {
+          "enum": [
+            "android-lp-container",
+            "android-logical-partition",
+            "factory-artifact",
+            "raw-gpt-disk",
+            "boot-filesystem"
+          ]
+        },
+        "bytes": {
+          "$ref": "#/$defs/decimal"
+        },
+        "source_partition_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "immutable": {
+          "const": true
+        },
+        "local_lv_uuid": {
+          "$ref": "#/$defs/lvmUuid"
+        },
+        "local_form": {
+          "enum": [
+            "thick-raw",
+            "sparse-thin-raw",
+            "expanded-thin-raw",
+            "off-device-only"
+          ]
+        },
+        "verification": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source_sha256",
+            "destination_sha256"
+          ],
+          "properties": {
+            "source_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "destination_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        "off_device_copies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/offDeviceCopy"
+          }
+        }
+      }
+    },
+    "offDeviceCopy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "copy_id",
+        "location_class",
+        "medium",
+        "bytes",
+        "sha256",
+        "verified"
+      ],
+      "properties": {
+        "copy_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "location_class": {
+          "const": "off-device"
+        },
+        "medium": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bytes": {
+          "$ref": "#/$defs/decimal"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "verified": {
+          "type": "boolean"
+        }
+      }
+    },
+    "firmwareGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "bundle_sha256",
+        "off_device_verified",
+        "extractor",
+        "load_test"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "pending",
+            "satisfied",
+            "failed"
+          ]
+        },
+        "bundle_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "off_device_verified": {
+          "type": "boolean"
+        },
+        "extractor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "config",
+            "commit"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "config": {
+              "type": "string",
+              "minLength": 1
+            },
+            "commit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            }
+          }
+        },
+        "load_test": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kernel_build",
+            "passed"
+          ],
+          "properties": {
+            "kernel_build": {
+              "type": "string",
+              "minLength": 1
+            },
+            "passed": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "activeOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_uuid",
+        "partition_id",
+        "state"
+      ],
+      "properties": {
+        "operation_uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "partition_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

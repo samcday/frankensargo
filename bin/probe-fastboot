@@ -1,0 +1,98 @@
+#!/bin/sh
+set -eu
+
+serial=
+serial_seen=0
+
+usage() {
+    cat <<'EOF'
+usage: bin/probe-fastboot --serial SERIAL
+
+Read a small, fixed set of fastboot variables from one explicitly named device.
+This command does not boot, flash, erase, switch slots, continue, or reboot.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --serial)
+            [ "$#" -ge 2 ] || { echo "probe-fastboot: --serial needs a value" >&2; exit 2; }
+            [ "$serial_seen" -eq 0 ] || {
+                echo "probe-fastboot: --serial may only be specified once" >&2
+                exit 2
+            }
+            serial=$2
+            serial_seen=1
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "probe-fastboot: unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+[ -n "$serial" ] || {
+    echo "probe-fastboot: an explicit --serial is required" >&2
+    exit 2
+}
+case $serial in
+    *[!A-Za-z0-9._:-]*|-*)
+        echo "probe-fastboot: serial contains unsafe characters" >&2
+        exit 2
+        ;;
+esac
+command -v fastboot >/dev/null 2>&1 || {
+    echo "probe-fastboot: fastboot is not installed" >&2
+    exit 1
+}
+
+getvar() {
+    name=$1
+    printf '\n[%s]\n' "$name"
+    if ! fastboot -s "$serial" getvar "$name" 2>&1; then
+        echo "probe-fastboot: getvar failed for serial $serial: $name" >&2
+        exit 1
+    fi
+}
+
+if ! product_output=$(fastboot -s "$serial" getvar product 2>&1); then
+    echo "probe-fastboot: explicit serial is not responding in fastboot mode: $serial" >&2
+    exit 1
+fi
+printf '[product]\n%s\n' "$product_output"
+printf '%s\n' "$product_output" | grep -Eq '(^|[[:space:]:])sargo([[:space:]]|$)' || {
+    echo "probe-fastboot: refusing non-sargo product" >&2
+    exit 1
+}
+
+printf '\n[serialno]\n'
+if ! serial_output=$(fastboot -s "$serial" getvar serialno 2>&1); then
+    echo "probe-fastboot: getvar failed for serial $serial: serialno" >&2
+    exit 1
+fi
+printf '%s\n' "$serial_output"
+reported_serial=$(printf '%s\n' "$serial_output" | sed -n \
+    -e 's/^[[:space:]]*(bootloader)[[:space:]]*serialno:[[:space:]]*\([A-Za-z0-9._:-][A-Za-z0-9._:-]*\)[[:space:]]*$/\1/p' \
+    -e 's/^[[:space:]]*serialno:[[:space:]]*\([A-Za-z0-9._:-][A-Za-z0-9._:-]*\)[[:space:]]*$/\1/p')
+[ -n "$reported_serial" ] || {
+    echo "probe-fastboot: bootloader did not report an unambiguous serialno" >&2
+    exit 1
+}
+[ "$reported_serial" = "$serial" ] || {
+    echo "probe-fastboot: bootloader serialno does not match requested serial" >&2
+    echo "  requested: $serial" >&2
+    echo "  reported:  $reported_serial" >&2
+    exit 1
+}
+
+getvar current-slot
+getvar unlocked
+getvar secure
+getvar max-download-size
+getvar battery-voltage

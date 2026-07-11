@@ -1,0 +1,52 @@
+# Audited source revisions. This file is POSIX-shell syntax so the build and
+# status tools can consume it without another parser.
+
+POCKETBOOT_URL=https://github.com/samcday/pocketboot.git
+POCKETBOOT_REV=84be0aa061681df6721d8483206d73d88bbab6e3
+POCKETBOOT_BRANCH=main
+POCKETBOOT_LOCAL=/var/home/sam/src/pocketboot
+
+# Known-working sargo kernel used by the July 2026 PocketBoot image. The
+# upstream branch has moved since this tag; move this pin only after a boot,
+# UART, USB gadget, and kexec smoke test on frankensargo.
+SDM670_KERNEL_URL=https://gitlab.com/sdm670-mainline/linux.git
+SDM670_KERNEL_REV=6ecf2a5fe24af8a104814a3a9bc9b676b0bdffdf
+SDM670_KERNEL_BRANCH=on-stable
+SDM670_KERNEL_LOCAL=/var/home/sam/tmp/linux-sdm670-mainline
+
+POCKETFED_URL=https://github.com/samcday/pocketfed.git
+POCKETFED_REV=49b57a83595fb47bf19bb6156a7c9ce9a04d6b84
+POCKETFED_BRANCH=main
+POCKETFED_LOCAL=/var/home/sam/src/pocketfed
+
+DURANIUM_URL=https://gitlab.postmarketos.org/postmarketOS/duranium-build.git
+DURANIUM_REV=06a6f03ac38e5c52222564a781cac0c7f8e5c053
+DURANIUM_BRANCH=main
+DURANIUM_LOCAL=/var/home/sam/src/duranium-build
+
+PMAPORTS_URL=https://gitlab.postmarketos.org/postmarketOS/pmaports.git
+PMAPORTS_REV=8433274c9a301adc0ed24284f7f37a615f9e7b88
+PMAPORTS_BRANCH=main
+PMAPORTS_LOCAL=/var/home/sam/src/pmaports
+
+BENGALOS_URL=https://github.com/samcday/bengalos-recipes.git
+BENGALOS_REV=0682d2b81194913b672f5ec8801b3ca628503e62
+BENGALOS_BRANCH=main
+BENGALOS_LOCAL=/var/home/sam/src/bengalos-recipes
+
+FASTBOOP_URL=https://github.com/samcday/fastboop.git
+FASTBOOP_REV=fabf89c34183df8217141119c9dc758985845acd
+FASTBOOP_BRANCH=main
+FASTBOOP_LOCAL=/var/home/sam/src/fastboop
+
+DROID_JUICER_URL=https://github.com/samcday/droid-juicer.git
+DROID_JUICER_REV=306203319621f64b0b1dd21af34983968a029da6
+DROID_JUICER_BRANCH=main
+DROID_JUICER_LOCAL=/var/home/sam/src/droid-juicer
+
+# Hardware-proven UKI archaeology only. PocketBoot's loader is the actual
+# implementation base; this pin records the behavior that was audited.
+LK2ND2ND_URL=https://github.com/samcday/lk2nd2nd.git
+LK2ND2ND_REV=ac0a0624325f8dd3220a9c5c5d38ea383ca5b582
+LK2ND2ND_BRANCH=xmodem-lulz
+LK2ND2ND_LOCAL=/var/home/sam/src/lk2nd2nd

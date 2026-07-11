@@ -1,0 +1,10 @@
+diff --git a/configs/device/qcom/sdm670-google-sargo.toml b/configs/device/qcom/sdm670-google-sargo.toml
+--- a/configs/device/qcom/sdm670-google-sargo.toml
++++ b/configs/device/qcom/sdm670-google-sargo.toml
+@@ -18,4 +18,4 @@ ramdisk_offset = 0x01000000
+ second_offset = 0x00f00000
+ tags_offset = 0x00000100
+ dtb_offset = 0x01100000
+-cmdline = ""
++cmdline = "pocketboot.log=debug pocketboot.acm"
+

@@ -1,0 +1,76 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck disable=SC1091
+. "$ROOT/config/sources.lock"
+
+remote=0
+case ${1-} in
+    "") ;;
+    --remote) remote=1 ;;
+    -h|--help)
+        echo "usage: bin/source-status [--remote]"
+        echo "Reports local provenance without changing any checkout."
+        exit 0
+        ;;
+    *)
+        echo "source-status: unknown argument: $1" >&2
+        exit 2
+        ;;
+esac
+
+status_one() {
+    name=$1
+    path=$2
+    expected=$3
+    url=$4
+    branch=$5
+
+    if ! git -C "$path" rev-parse --git-dir >/dev/null 2>&1; then
+        printf '%-14s missing  %s\n' "$name" "$path"
+        return
+    fi
+
+    head=$(git -C "$path" rev-parse HEAD 2>/dev/null || printf unknown)
+    if [ "$head" = "$expected" ]; then
+        relation=pinned
+    elif ! git -C "$path" cat-file -e "$expected^{commit}" 2>/dev/null; then
+        relation=unfetched
+    elif git -C "$path" merge-base --is-ancestor "$expected" "$head" 2>/dev/null; then
+        relation=ahead
+    elif git -C "$path" merge-base --is-ancestor "$head" "$expected" 2>/dev/null; then
+        relation=behind
+    else
+        relation=diverged
+    fi
+
+    if [ -n "$(git -C "$path" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+        dirty=dirty
+    else
+        dirty=clean
+    fi
+
+    printf '%-14s %-8s %-5s local=%s expected=%s\n' \
+        "$name" "$relation" "$dirty" "$head" "$expected"
+
+    if [ "$remote" -eq 1 ]; then
+        remote_line=$(git ls-remote "$url" "refs/heads/$branch" 2>/dev/null || true)
+        remote_head=${remote_line%%[[:space:]]*}
+        if [ -n "$remote_head" ]; then
+            printf '%-14s remote   branch=%s head=%s\n' "" "$branch" "$remote_head"
+        else
+            printf '%-14s remote   unavailable (%s %s)\n' "" "$url" "$branch"
+        fi
+    fi
+}
+
+status_one pocketboot "$POCKETBOOT_LOCAL" "$POCKETBOOT_REV" "$POCKETBOOT_URL" "$POCKETBOOT_BRANCH"
+status_one sdm670-kernel "$SDM670_KERNEL_LOCAL" "$SDM670_KERNEL_REV" "$SDM670_KERNEL_URL" "$SDM670_KERNEL_BRANCH"
+status_one pocketfed "$POCKETFED_LOCAL" "$POCKETFED_REV" "$POCKETFED_URL" "$POCKETFED_BRANCH"
+status_one duranium "$DURANIUM_LOCAL" "$DURANIUM_REV" "$DURANIUM_URL" "$DURANIUM_BRANCH"
+status_one pmaports "$PMAPORTS_LOCAL" "$PMAPORTS_REV" "$PMAPORTS_URL" "$PMAPORTS_BRANCH"
+status_one bengalos "$BENGALOS_LOCAL" "$BENGALOS_REV" "$BENGALOS_URL" "$BENGALOS_BRANCH"
+status_one fastboop "$FASTBOOP_LOCAL" "$FASTBOOP_REV" "$FASTBOOP_URL" "$FASTBOOP_BRANCH"
+status_one droid-juicer "$DROID_JUICER_LOCAL" "$DROID_JUICER_REV" "$DROID_JUICER_URL" "$DROID_JUICER_BRANCH"
+status_one lk2nd2nd "$LK2ND2ND_LOCAL" "$LK2ND2ND_REV" "$LK2ND2ND_URL" "$LK2ND2ND_BRANCH"

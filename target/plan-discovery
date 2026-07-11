@@ -1,0 +1,228 @@
+#!/bin/sh
+
+set -eu
+
+LC_ALL=C
+export LC_ALL
+
+PROGRAM=${0##*/}
+
+usage()
+{
+	cat <<EOF
+Usage: $PROGRAM --manifest FILE
+
+Validate the two-stage outer-LVM discovery contract and print a deterministic
+plan. This command only reads the manifest; it does not inspect or modify a
+block device.
+EOF
+}
+
+die()
+{
+	printf '%s: %s\n' "$PROGRAM" "$*" >&2
+	exit 1
+}
+
+usage_error()
+{
+	printf '%s: %s\n' "$PROGRAM" "$*" >&2
+	usage >&2
+	exit 2
+}
+
+need_value()
+{
+	[ "$#" -ge 2 ] || usage_error "$1 requires an argument"
+	[ -n "$2" ] || usage_error "$1 requires a non-empty argument"
+}
+
+need_command()
+{
+	command -v "$1" >/dev/null 2>&1 ||
+		die "required command is unavailable: $1"
+}
+
+canonical_sha256()
+{
+	canonical_text=$1
+	canonical_digest=$(printf '%s\n' "$canonical_text" | sha256sum)
+	printf 'sha256:%s\n' "${canonical_digest%% *}"
+}
+
+manifest=
+manifest_seen=0
+
+while [ "$#" -gt 0 ]; do
+	case $1 in
+		--manifest)
+			need_value "$@"
+			[ "$manifest_seen" -eq 0 ] ||
+				usage_error '--manifest may only be specified once'
+			manifest=$2
+			manifest_seen=1
+			shift 2
+			;;
+		--manifest=*)
+			[ "$manifest_seen" -eq 0 ] ||
+				usage_error '--manifest may only be specified once'
+			manifest=${1#*=}
+			[ -n "$manifest" ] ||
+				usage_error '--manifest requires a non-empty argument'
+			manifest_seen=1
+			shift
+			;;
+		--help | -h)
+			usage
+			exit 0
+			;;
+		--)
+			shift
+			[ "$#" -eq 0 ] ||
+				usage_error 'positional arguments are not accepted'
+			;;
+		-*)
+			usage_error "unknown option: $1"
+			;;
+		*)
+			usage_error "unexpected positional argument: $1"
+			;;
+	esac
+done
+
+[ "$manifest_seen" -eq 1 ] || usage_error '--manifest is required'
+
+need_command jq
+need_command sha256sum
+
+[ -f "$manifest" ] && [ -r "$manifest" ] ||
+	die "manifest is not a readable regular file: $manifest"
+jq empty "$manifest" >/dev/null 2>&1 || die 'manifest is not valid JSON'
+
+uuid_pattern='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+lvm_uuid_pattern='^[A-Za-z0-9]{6}(-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}$'
+
+jq -e --arg uuid_pattern "$uuid_pattern" \
+	--arg lvm_uuid_pattern "$lvm_uuid_pattern" '
+	.schema == "org.pocketboot.greygoo/1" and
+	(.generation | type == "number" and . >= 0 and floor == .) and
+	(.device.gpt_disk_guid | type == "string" and test($uuid_pattern)) and
+	(.capsule_binding.anchor_partuuid |
+	 type == "string" and test($uuid_pattern)) and
+	(.capsule_binding.vg_uuid |
+	 type == "string" and test($lvm_uuid_pattern)) and
+	(.lvm.vg_uuid | type == "string" and test($lvm_uuid_pattern)) and
+	(.lvm.anchor_pv_uuid |
+	 type == "string" and test($lvm_uuid_pattern)) and
+	(.lvm.allowed_pvs | type == "array" and length > 0) and
+	(.partitions | type == "array") and
+	(all(.lvm.allowed_pvs[];
+	  (.partition_id | type == "string") and
+	  (.partuuid | type == "string" and test($uuid_pattern)) and
+	  (.pv_uuid | type == "string" and test($lvm_uuid_pattern))))
+	' "$manifest" >/dev/null 2>&1 ||
+	die 'manifest does not contain a well-formed discovery contract'
+
+jq -e '
+	(.lvm.allowed_pvs | length) as $count |
+	([.lvm.allowed_pvs[].partition_id] | unique | length) == $count and
+	([.lvm.allowed_pvs[].partuuid] | unique | length) == $count and
+	([.lvm.allowed_pvs[].pv_uuid] | unique | length) == $count and
+	((.partitions | length) as $partition_count |
+	 ([.partitions[].id] | unique | length) == $partition_count and
+	 ([.partitions[].identity.partuuid] | unique | length) ==
+	   $partition_count and
+	 ([.partitions[].takeover.planned_pv_uuid] | unique | length) ==
+	   $partition_count)
+	' "$manifest" >/dev/null 2>&1 ||
+	die 'partition and PV identities must be unique'
+
+jq -e '
+	.device.gpt_disk_guid as $disk_guid |
+	all(.lvm.allowed_pvs[];
+	  .partition_id == ("gpt:" + $disk_guid + "/" + .partuuid))
+	' "$manifest" >/dev/null 2>&1 ||
+	die 'an allowed PV does not agree with the device GPT identity'
+
+jq -e '
+	(.capsule_binding.vg_uuid == .lvm.vg_uuid) and
+	(.capsule_binding.anchor_partuuid as $anchor_partuuid |
+	 .lvm.anchor_pv_uuid as $anchor_pv_uuid |
+	 ([.lvm.allowed_pvs[] |
+	   select(.partuuid == $anchor_partuuid and
+	          .pv_uuid == $anchor_pv_uuid)] | length) == 1)
+	' "$manifest" >/dev/null 2>&1 ||
+	die 'capsule binding does not select the exact anchor PV in the expected VG'
+
+jq -e '
+	. as $manifest |
+	all(.lvm.allowed_pvs[]; . as $allowed |
+	  if .partuuid == $manifest.capsule_binding.anchor_partuuid then
+	    true
+	  else
+	    ([$manifest.partitions[]? |
+	      select(.id == $allowed.partition_id and
+	             .identity.partuuid == $allowed.partuuid and
+	             .classification == "member" and
+	             .takeover.planned_pv_uuid == $allowed.pv_uuid and
+	             (.takeover.state == "vg-member-fenced" or
+	              .takeover.state == "capacity-released" or
+	              .takeover.state == "absorbed"))] | length) == 1
+	  end) and
+	all(.partitions[]?; . as $partition |
+	  if .classification == "candidate" then
+	    ([$manifest.lvm.allowed_pvs[] |
+	      select(.partuuid == $partition.identity.partuuid or
+	             .pv_uuid == $partition.takeover.planned_pv_uuid)] |
+	     length) == 0
+	  elif .classification == "member" then
+	    (.takeover.state == "vg-member-fenced" or
+	     .takeover.state == "capacity-released" or
+	     .takeover.state == "absorbed") and
+	    ([$manifest.lvm.allowed_pvs[] |
+	      select(.partition_id == $partition.id and
+	             .partuuid == $partition.identity.partuuid and
+	             .pv_uuid == $partition.takeover.planned_pv_uuid)] |
+	     length) == 1
+	  else
+	    true
+	  end)
+	' "$manifest" >/dev/null 2>&1 ||
+	die 'allowed PV membership disagrees with the partition lifecycle'
+
+manifest_json=$(jq -cS . "$manifest")
+manifest_sha256=$(canonical_sha256 "$manifest_json")
+anchor_partuuid=$(jq -r '.capsule_binding.anchor_partuuid' "$manifest")
+
+jq -S --arg manifest_sha256 "$manifest_sha256" \
+	--arg anchor_partuuid "$anchor_partuuid" '
+	{
+	  schema: "org.pocketboot.greygoo.discovery-plan/1",
+	  manifest: {
+	    schema: .schema,
+	    generation: .generation,
+	    canonical_sha256: $manifest_sha256
+	  },
+	  capsule_binding: .capsule_binding,
+	  stage1_anchor_only: {
+	    vg_uuid: .lvm.vg_uuid,
+	    devices:
+	      ([.lvm.allowed_pvs[] |
+	        select(.partuuid == $anchor_partuuid)] | sort_by(.partuuid)),
+	    eligible_lv_tags: ["pocketboot.meta.v1"]
+	  },
+	  stage2_manifest_allowlist: {
+	    vg_uuid: .lvm.vg_uuid,
+	    devices: (.lvm.allowed_pvs | sort_by(.partuuid)),
+	    eligible_lv_tags: [
+	      "pocketboot.meta.v1",
+	      "pocketboot.bootfs.v1",
+	      "pocketboot.disk.v1"
+	    ]
+	  },
+	  constraints: {
+	    physical_partuuid_pv_uuid_pairs_only: true,
+	    recursive_guest_lvm_scan: false,
+	    exposed_device_mapper_nodes_read_only: true
+	  }
+	}' "$manifest"

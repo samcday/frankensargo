@@ -1,0 +1,479 @@
+#!/bin/sh
+
+set -eu
+
+LC_ALL=C
+export LC_ALL
+
+PROGRAM=${0##*/}
+SCRIPT_DIR=$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd)
+DISCOVERY_PLANNER=$SCRIPT_DIR/plan-discovery
+
+usage()
+{
+	cat <<EOF
+Usage: $PROGRAM --manifest FILE --partition-id ID --operation-uuid UUID
+
+Validate a ready grey-goo donor and print a deterministic, hash-bound JSON
+authorization plan plus its explicit confirmation token. This command only
+reads the manifest; it does not inspect or modify a block device.
+EOF
+}
+
+die()
+{
+	printf '%s: %s\n' "$PROGRAM" "$*" >&2
+	exit 1
+}
+
+usage_error()
+{
+	printf '%s: %s\n' "$PROGRAM" "$*" >&2
+	usage >&2
+	exit 2
+}
+
+need_value()
+{
+	[ "$#" -ge 2 ] || usage_error "$1 requires an argument"
+	[ -n "$2" ] || usage_error "$1 requires a non-empty argument"
+}
+
+need_command()
+{
+	command -v "$1" >/dev/null 2>&1 ||
+		die "required command is unavailable: $1"
+}
+
+canonical_sha256()
+{
+	canonical_text=$1
+	canonical_digest=$(printf '%s\n' "$canonical_text" | sha256sum)
+	printf 'sha256:%s\n' "${canonical_digest%% *}"
+}
+
+manifest=
+manifest_seen=0
+partition_id=
+partition_seen=0
+operation_uuid=
+operation_seen=0
+
+while [ "$#" -gt 0 ]; do
+	case $1 in
+		--manifest)
+			need_value "$@"
+			[ "$manifest_seen" -eq 0 ] ||
+				usage_error '--manifest may only be specified once'
+			manifest=$2
+			manifest_seen=1
+			shift 2
+			;;
+		--manifest=*)
+			[ "$manifest_seen" -eq 0 ] ||
+				usage_error '--manifest may only be specified once'
+			manifest=${1#*=}
+			[ -n "$manifest" ] || usage_error '--manifest requires a non-empty argument'
+			manifest_seen=1
+			shift
+			;;
+		--partition-id)
+			need_value "$@"
+			[ "$partition_seen" -eq 0 ] ||
+				usage_error '--partition-id may only be specified once'
+			partition_id=$2
+			partition_seen=1
+			shift 2
+			;;
+		--partition-id=*)
+			[ "$partition_seen" -eq 0 ] ||
+				usage_error '--partition-id may only be specified once'
+			partition_id=${1#*=}
+			[ -n "$partition_id" ] ||
+				usage_error '--partition-id requires a non-empty argument'
+			partition_seen=1
+			shift
+			;;
+		--operation-uuid)
+			need_value "$@"
+			[ "$operation_seen" -eq 0 ] ||
+				usage_error '--operation-uuid may only be specified once'
+			operation_uuid=$2
+			operation_seen=1
+			shift 2
+			;;
+		--operation-uuid=*)
+			[ "$operation_seen" -eq 0 ] ||
+				usage_error '--operation-uuid may only be specified once'
+			operation_uuid=${1#*=}
+			[ -n "$operation_uuid" ] ||
+				usage_error '--operation-uuid requires a non-empty argument'
+			operation_seen=1
+			shift
+			;;
+		--help | -h)
+			usage
+			exit 0
+			;;
+		--)
+			shift
+			[ "$#" -eq 0 ] || usage_error 'positional arguments are not accepted'
+			;;
+		-*)
+			usage_error "unknown option: $1"
+			;;
+		*)
+			usage_error "unexpected positional argument: $1"
+			;;
+	esac
+done
+
+[ "$manifest_seen" -eq 1 ] || usage_error '--manifest is required'
+[ "$partition_seen" -eq 1 ] || usage_error '--partition-id is required'
+[ "$operation_seen" -eq 1 ] || usage_error '--operation-uuid is required'
+
+need_command jq
+need_command cut
+need_command mktemp
+need_command rm
+need_command sha256sum
+
+[ -f "$manifest" ] && [ -r "$manifest" ] ||
+	die "manifest is not a readable regular file: $manifest"
+[ -x "$DISCOVERY_PLANNER" ] ||
+	die "discovery planner is not executable: $DISCOVERY_PLANNER"
+jq empty "$manifest" >/dev/null 2>&1 || die 'manifest is not valid JSON'
+
+uuid_pattern='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+sha_pattern='^sha256:[0-9a-f]{64}$'
+lvm_uuid_pattern='^[A-Za-z0-9]{6}(-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}$'
+decimal_pattern='^(0|[1-9][0-9]{0,17})$'
+
+jq -en --arg value "$operation_uuid" --arg pattern "$uuid_pattern" \
+	'$value | test($pattern)' >/dev/null 2>&1 ||
+	die "operation UUID is not canonical: $operation_uuid"
+
+jq -e --arg uuid_pattern "$uuid_pattern" \
+	--arg sha_pattern "$sha_pattern" \
+	--arg lvm_uuid_pattern "$lvm_uuid_pattern" '
+	.schema == "org.pocketboot.greygoo/1" and
+	(.generation | type == "number" and . >= 0 and floor == .) and
+	(.device.uuid | type == "string" and test($uuid_pattern)) and
+	.device.product == "sargo" and
+	(.device.fastboot_serial | type == "string" and length > 0) and
+	(.device.emmc_cid | type == "string" and test("^[0-9a-f]{32}$")) and
+	(.device.gpt_disk_guid | type == "string" and test($uuid_pattern)) and
+	(.device.inventory_sha256 | type == "string" and test($sha_pattern)) and
+	(.lvm.vg_name | type == "string" and length > 0) and
+	(.lvm.vg_uuid | type == "string" and test($lvm_uuid_pattern)) and
+	(.lvm.anchor_pv_uuid | type == "string" and test($lvm_uuid_pattern))
+	' "$manifest" >/dev/null 2>&1 ||
+	die 'manifest header, device identity, or anchor VG identity is invalid'
+
+jq -e 'has("active_operation") and .active_operation == null' \
+	"$manifest" >/dev/null 2>&1 ||
+	die 'manifest already has an active operation'
+
+"$DISCOVERY_PLANNER" --manifest "$manifest" >/dev/null ||
+	die 'manifest outer-LVM discovery contract is invalid'
+
+partition_count=$(jq -r --arg id "$partition_id" \
+	'[.partitions[]? | select(.id == $id)] | length' "$manifest")
+[ "$partition_count" = 1 ] ||
+	die "partition ID must match exactly one manifest entry: $partition_id"
+
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/frankensargo-absorb.XXXXXX")
+cleanup()
+{
+	rm -rf "$tmpdir"
+}
+trap cleanup 0 1 2 15
+
+partition_file=$tmpdir/partition.json
+core_file=$tmpdir/authorization-core.json
+jq -S --arg id "$partition_id" \
+	'.partitions[] | select(.id == $id)' "$manifest" >"$partition_file"
+
+jq -e --arg uuid_pattern "$uuid_pattern" \
+	--arg sha_pattern "$sha_pattern" \
+	--arg lvm_uuid_pattern "$lvm_uuid_pattern" \
+	--arg decimal_pattern "$decimal_pattern" '
+	.classification == "candidate" and
+	.takeover.state == "ready" and
+	(.lp_extent_gate.required | type == "boolean") and
+	.identity.immutable == true and
+	.geometry.immutable == true and
+	.raw.immutable == true and
+	.takeover.planned_pv_uuid_immutable == true and
+	(.identity.parent_disk_guid | type == "string" and test($uuid_pattern)) and
+	(.identity.partuuid | type == "string" and test($uuid_pattern)) and
+	(.identity.partlabel | type == "string" and length > 0) and
+	(.geometry.start_lba | type == "string" and test($decimal_pattern)) and
+	(.geometry.sectors | type == "string" and test($decimal_pattern)) and
+	(.geometry.logical_sector_bytes == 512 or
+	 .geometry.logical_sector_bytes == 4096) and
+	(.raw.bytes | type == "string" and test($decimal_pattern)) and
+	(.raw.sha256 | type == "string" and test($sha_pattern)) and
+	(.archive_object_id | type == "string" and test($sha_pattern)) and
+	(.takeover.planned_pv_uuid |
+	 type == "string" and test($lvm_uuid_pattern)) and
+	(.takeover.binding_sha256 | type == "string" and test($sha_pattern)) and
+	([.capacity.donor_bytes,
+	  .capacity.retained_allocated_bytes,
+	  .capacity.metadata_growth_bytes,
+	  .capacity.reserve_bytes,
+	  .capacity.conservative_net_bytes] |
+	 all(type == "string" and test($decimal_pattern)))
+	' "$partition_file" >/dev/null 2>&1 ||
+	die 'partition is not a ready, immutable absorption candidate'
+
+device_uuid=$(jq -r '.device.uuid' "$manifest")
+device_disk_guid=$(jq -r '.device.gpt_disk_guid' "$manifest")
+parent_disk_guid=$(jq -r '.identity.parent_disk_guid' "$partition_file")
+partuuid=$(jq -r '.identity.partuuid' "$partition_file")
+partition_name=$(jq -r '.name' "$partition_file")
+partlabel=$(jq -r '.identity.partlabel' "$partition_file")
+expected_partition_id="gpt:$parent_disk_guid/$partuuid"
+
+[ "$partition_id" = "$expected_partition_id" ] ||
+	die 'partition ID does not agree with its immutable GPT identity'
+[ "$parent_disk_guid" = "$device_disk_guid" ] ||
+	die 'partition belongs to a different GPT disk identity'
+[ "$partition_name" = "$partlabel" ] ||
+	die 'partition name does not agree with its immutable GPT label'
+
+start_lba=$(jq -r '.geometry.start_lba' "$partition_file")
+sectors=$(jq -r '.geometry.sectors' "$partition_file")
+sector_bytes=$(jq -r '.geometry.logical_sector_bytes' "$partition_file")
+raw_bytes=$(jq -r '.raw.bytes' "$partition_file")
+raw_sha256=$(jq -r '.raw.sha256' "$partition_file")
+archive_object_id=$(jq -r '.archive_object_id' "$partition_file")
+
+[ "$sectors" -gt 0 ] || die 'partition sector count must be positive'
+[ "$raw_bytes" -gt 0 ] || die 'partition byte size must be positive'
+max_integer=9223372036854775807
+[ "$sectors" -le $((max_integer / sector_bytes)) ] ||
+	die 'partition geometry exceeds planner arithmetic limits'
+calculated_raw_bytes=$((sectors * sector_bytes))
+[ "$calculated_raw_bytes" -eq "$raw_bytes" ] ||
+	die 'raw byte size does not equal sectors times logical sector size'
+[ "$start_lba" -le $((max_integer - sectors)) ] ||
+	die 'partition end LBA exceeds planner arithmetic limits'
+
+[ "$archive_object_id" = "$raw_sha256" ] ||
+	die 'archive object ID is not the content-addressed raw hash'
+
+binding_json=$(jq -cS --arg device_uuid "$device_uuid" '
+	{
+	  device_uuid: $device_uuid,
+	  partition_id: .id,
+	  parent_disk_guid: .identity.parent_disk_guid,
+	  partuuid: .identity.partuuid,
+	  partlabel: .identity.partlabel,
+	  start_lba: .geometry.start_lba,
+	  sectors: .geometry.sectors,
+	  logical_sector_bytes: .geometry.logical_sector_bytes,
+	  raw_bytes: .raw.bytes,
+	  raw_sha256: .raw.sha256,
+	  planned_pv_uuid: .takeover.planned_pv_uuid
+	}' "$partition_file")
+calculated_binding_sha256=$(canonical_sha256 "$binding_json")
+recorded_binding_sha256=$(jq -r '.takeover.binding_sha256' "$partition_file")
+[ "$calculated_binding_sha256" = "$recorded_binding_sha256" ] ||
+	die 'immutable partition binding hash does not match its fields'
+
+archive_count=$(jq -r --arg object_id "$archive_object_id" \
+	'[.objects[]? | select(.id == $object_id)] | length' "$manifest")
+[ "$archive_count" = 1 ] ||
+	die 'archive object ID must match exactly one manifest object'
+
+jq -e --arg object_id "$archive_object_id" \
+	--arg partition_id "$partition_id" \
+	--arg raw_bytes "$raw_bytes" \
+	--arg raw_sha256 "$raw_sha256" '
+	.objects[] | select(.id == $object_id) |
+	.immutable == true and
+	.source_partition_id == $partition_id and
+	.bytes == $raw_bytes and
+	.verification.source_sha256 == $raw_sha256 and
+	.verification.destination_sha256 == $raw_sha256 and
+	([.off_device_copies[]? |
+	  select(.location_class == "off-device" and
+	         .verified == true and
+	         .bytes == $raw_bytes and
+	         .sha256 == $raw_sha256)] | length > 0)
+	' "$manifest" >/dev/null 2>&1 ||
+	die 'archive is not immutable and matched by a verified off-device copy'
+
+lp_extent_gate_required=$(jq -r '.lp_extent_gate.required' "$partition_file")
+case $lp_extent_gate_required in
+	true)
+		jq -e --arg sha_pattern "$sha_pattern" '
+			.lp_extent_gate.status == "satisfied" and
+			(.lp_extent_gate.metadata_sha256 |
+			 type == "string" and test($sha_pattern)) and
+			(.lp_extent_gate.extent_graph_sha256 |
+			 type == "string" and test($sha_pattern)) and
+			.lp_extent_gate.all_touching_extents_archived == true and
+			.lp_extent_gate.archive_mappings_verified == true
+			' "$partition_file" >/dev/null 2>&1 ||
+			die 'required Android LP extent gate is not fully satisfied'
+		jq -e --arg object_id "$archive_object_id" '
+			.objects[] | select(.id == $object_id) |
+			.kind == "android-lp-container"
+			' "$manifest" >/dev/null 2>&1 ||
+			die 'Android LP extent gate requires a raw LP-container archive'
+		;;
+	false)
+		jq -e '
+			.lp_extent_gate.status == "not-required" and
+			.lp_extent_gate.metadata_sha256 == null and
+			.lp_extent_gate.extent_graph_sha256 == null and
+			.lp_extent_gate.all_touching_extents_archived == false and
+			.lp_extent_gate.archive_mappings_verified == false
+			' "$partition_file" >/dev/null 2>&1 ||
+			die 'non-required Android LP extent gate is inconsistent'
+		;;
+	*)
+		die 'Android LP extent gate requirement is not a boolean'
+		;;
+esac
+
+firmware_gate_required=$(jq -r '.firmware_gate_required' "$partition_file")
+case $firmware_gate_required in
+	true)
+		jq -e --arg sha_pattern "$sha_pattern" '
+			.firmware_gate.status == "satisfied" and
+			.firmware_gate.off_device_verified == true and
+			.firmware_gate.load_test.passed == true and
+			(.firmware_gate.bundle_sha256 |
+			 type == "string" and test($sha_pattern))
+			' "$manifest" >/dev/null 2>&1 ||
+			die 'required firmware gate is not fully satisfied'
+		;;
+	false)
+		;;
+	*)
+		die 'firmware_gate_required is not a boolean'
+		;;
+esac
+
+donor_bytes=$(jq -r '.capacity.donor_bytes' "$partition_file")
+retained_bytes=$(jq -r '.capacity.retained_allocated_bytes' "$partition_file")
+metadata_bytes=$(jq -r '.capacity.metadata_growth_bytes' "$partition_file")
+reserve_bytes=$(jq -r '.capacity.reserve_bytes' "$partition_file")
+recorded_net_bytes=$(jq -r '.capacity.conservative_net_bytes' "$partition_file")
+
+[ "$donor_bytes" -eq "$raw_bytes" ] ||
+	die 'capacity donor size does not match immutable raw size'
+[ "$retained_bytes" -le "$donor_bytes" ] &&
+	[ "$metadata_bytes" -le "$donor_bytes" ] &&
+	[ "$reserve_bytes" -le "$donor_bytes" ] ||
+	die 'a capacity deduction exceeds donor size'
+deducted_bytes=$((retained_bytes + metadata_bytes + reserve_bytes))
+[ "$donor_bytes" -gt "$deducted_bytes" ] ||
+	die 'conservative net capacity is not positive'
+calculated_net_bytes=$((donor_bytes - deducted_bytes))
+[ "$recorded_net_bytes" -eq "$calculated_net_bytes" ] ||
+	die 'recorded conservative net capacity does not match its inputs'
+
+manifest_json=$(jq -cS . "$manifest")
+manifest_sha256=$(canonical_sha256 "$manifest_json")
+
+jq -S --arg operation_uuid "$operation_uuid" \
+	--arg manifest_sha256 "$manifest_sha256" \
+	--arg partition_id "$partition_id" \
+	--arg object_id "$archive_object_id" '
+	. as $manifest |
+	([.partitions[] | select(.id == $partition_id)][0]) as $partition |
+	([.objects[] | select(.id == $object_id)][0]) as $object |
+	{
+	  schema: "org.pocketboot.greygoo.absorb-authorization/1",
+	  action: "absorb-partition",
+	  operation_uuid: $operation_uuid,
+	  manifest: {
+	    schema: $manifest.schema,
+	    generation: $manifest.generation,
+	    canonical_sha256: $manifest_sha256
+	  },
+	  capsule_binding: $manifest.capsule_binding,
+	  device: $manifest.device,
+	  lvm: {
+	    vg_name: $manifest.lvm.vg_name,
+	    vg_uuid: $manifest.lvm.vg_uuid,
+	    anchor_pv_uuid: $manifest.lvm.anchor_pv_uuid,
+	    allowed_pvs: ($manifest.lvm.allowed_pvs | sort_by(.partuuid))
+	  },
+	  partition: {
+	    id: $partition.id,
+	    name: $partition.name,
+	    identity: $partition.identity,
+	    geometry: $partition.geometry,
+	    raw: $partition.raw,
+	    planned_pv_uuid: $partition.takeover.planned_pv_uuid,
+	    binding_sha256: $partition.takeover.binding_sha256
+	  },
+	  archive: {
+	    object_id: $object.id,
+	    verified_off_device_copy_ids:
+	      ([$object.off_device_copies[] |
+	        select(.location_class == "off-device" and
+	               .verified == true and
+	               .bytes == $partition.raw.bytes and
+	               .sha256 == $partition.raw.sha256) |
+	        .copy_id] | sort)
+	  },
+	  lp_extent_gate: $partition.lp_extent_gate,
+	  firmware_gate:
+	    (if $partition.firmware_gate_required then
+	       {
+	         required: true,
+	         status: $manifest.firmware_gate.status,
+	         bundle_sha256: $manifest.firmware_gate.bundle_sha256,
+	         off_device_verified: $manifest.firmware_gate.off_device_verified,
+	         load_test_passed: $manifest.firmware_gate.load_test.passed
+	       }
+	     else
+	       {required: false}
+	     end),
+	  capacity: $partition.capacity,
+	  preconditions:
+	    ([
+	       "manifest-hash-bound",
+	       "exact-partition-identity-bound",
+	       "target-state-ready",
+	       "immutable-binding-verified",
+	       "off-device-copy-verified",
+	       "two-stage-discovery-contract-verified",
+	       "no-active-operation",
+	       "positive-conservative-net-capacity"
+	     ] +
+	     (if $partition.firmware_gate_required then
+	        ["firmware-gate-satisfied"]
+	      else
+	        []
+	      end) +
+	     (if $partition.lp_extent_gate.required then
+	        ["android-lp-extent-gate-satisfied"]
+	      else
+	        []
+	      end))
+	}' "$manifest" >"$core_file"
+
+core_json=$(jq -cS . "$core_file")
+authorization_sha256=$(canonical_sha256 "$core_json")
+authorization_hex=${authorization_sha256#sha256:}
+operation_prefix=${operation_uuid%%-*}
+authorization_prefix=$(printf '%s' "$authorization_hex" | cut -c 1-12)
+confirmation_token="ABSORB-$operation_prefix-$authorization_prefix"
+
+jq -S --arg authorization_sha256 "$authorization_sha256" \
+	--arg confirmation_token "$confirmation_token" '
+	. + {
+	  authorization_sha256: $authorization_sha256,
+	  confirmation: {
+	    token: $confirmation_token,
+	    instruction:
+	      "Type this token exactly to authorize only the bound operation."
+	  }
+	}' "$core_file"

@@ -1,0 +1,226 @@
+# frankensargo
+
+One Pixel 3a (`sargo`), several immutable Linuxes, and an expanding grey goo
+made of LVM. The curse is intentional; the consent and recovery boundaries are
+not.
+
+The canonical design is now **LVM all the way up to Linux `/boot`**. Android's
+`boot_a` and `boot_b` remain tiny ABL-facing PocketBoot capsules, or the same
+takeover image can be launched transiently with `fastboot boot`. Everything
+PocketBoot launches may live inside the owned VG:
+
+```text
+ABL
+ ├── boot_a / boot_b                 PocketBoot capsules, outside LVM
+ └── transient fastboot boot         takeover/recovery PocketBoot
+                 │
+                 ▼
+       VG franken  [pocketboot.vg.v1]
+         ├── ggmeta                  thick transaction metadata
+         ├── boot-rescue             thick boot filesystem
+         ├── boot-*                  tagged BLS/UKI filesystems
+         ├── home                    thick shared *.home backing store
+         ├── homed-state             thick homed identity/signing state
+         ├── pool_tmeta + pmspare    thick, permanently on userdata
+         └── thin pool
+              ├── disk-mobian        complete nested GPT disk
+              ├── disk-duranium      complete nested GPT disk
+              ├── root-pocketfed     direct filesystem root
+              ├── android-*          extracted logical artifacts
+              └── arc-*              sparse local factory-image copies
+```
+
+The capsule binds the userdata-anchor PARTUUID and exact VG UUID. PocketBoot
+first exposes only that PV; after reading the thick metadata LV it uses the
+manifest's exact physical PARTUUID/PV UUID pairs. It then activates only
+explicitly tagged LVs. A `pocketboot.bootfs.v1` LV is mounted and scanned
+directly. A
+`pocketboot.disk.v1` LV is treated as a disk, its nested GPT is parsed, and its
+ESP/XBOOTLDR/boot filesystem is scanned. This admits ordinary Mobian and
+Duranium disk images without flattening their native layouts.
+
+## Expanding grey goo
+
+The first explicitly destructive operation converts `userdata` into the
+anchor PV. Later, the takeover profile absorbs one donor partition at a time:
+
+```text
+discovered -> copying -> archive-verified -> ready -> authorized
+           -> absorb-intent -> pv-present -> vg-member-fenced
+           -> capacity-released -> absorbed
+```
+
+Importing artifacts into already-owned LVM space is reversible and may be
+automated. Writing the donor is a separate, one-shot authorization bound to the
+phone identity, GPT identity, exact PARTUUID/start/size, full source hash,
+archive object, planned PV UUID, requested capacity change, and manifest
+generation.
+
+Before `system_a` or `system_b` can reach `ready`, the process must:
+
+1. inventory every Android logical-partition extent touching that container;
+2. make and fully verify an off-device raw copy;
+3. retain any wanted raw/logical artifacts as verified thin LVs;
+4. extract and hash the sargo firmware bundle off-device; and
+5. cold-boot the intended kernel and prove the firmware actually loads.
+
+The manifest carries hashes of the raw LP metadata and reverse extent graph,
+plus explicit assertions that every touching extent is archived and that
+mappings reconstructed from the archive match the source.
+
+The off-device raw copy is the rollback authority. A sparse on-device archive
+is useful, but is not a backup. The authorization plan must report:
+
+```text
+net gain = donor bytes
+         - newly allocated retained-artifact blocks
+         - metadata growth
+         - mandatory free-space reserve
+```
+
+No positive net gain means no takeover.
+
+## Two PocketBoot personalities
+
+- **normal** activates only allowlisted candidates and requires every exposed
+  boot/disk device to be read-only, scans BLS plus Type #2 UKIs, launches the
+  selected payload, and exposes recovery.
+- **takeover** is preferably transient. It adds LVM mutation tools, Android LP
+  mapping/import, resumable hashing/copying, the transaction journal, and the
+  explicit authorization UI.
+
+Normal mode never contains a generic "absorb everything" workflow. This is an
+accident boundary, not a security boundary: the lab capsule deliberately has
+unauthenticated root debug and fastboot surfaces, and canonical LVM userspace
+contains mutation subcommands. After the first donor write, recovery is
+forward-only unless a separately authorized restore transaction has enough
+external staging space.
+
+## Host-only work
+
+The default validation and build workflow is phone-free:
+
+```sh
+make check
+bin/source-status --remote
+bin/build-pocketboot --prepare-only
+bin/build-pocketboot
+(cd out/pocketboot && sha256sum -c pocketboot-sargo-lab.img.sha256)
+```
+
+`make check` uses regular sparse files. `build-pocketboot` builds files only
+and never runs fastboot; the full invocation writes the image, checksum, and
+input/patch provenance under `out/pocketboot/`. Source revisions are pinned in
+[`config/sources.lock`](config/sources.lock); the sdm670 beta4 kernel remains
+pinned until a frankensargo UART, USB gadget, storage, and kexec smoke test says
+otherwise.
+
+The current PocketBoot patch is an intentionally interim bridge to the final
+two-stage contract. It can bind discovery to exactly one
+`pocketboot.vg_uuid=` plus repeated `pocketboot.pv_partuuid=` kernel arguments,
+rejects removable, missing, duplicate, or ambiguous matches, and otherwise
+leaves LVM discovery disabled. It does **not** yet read `ggmeta` or validate the
+manifest's PARTUUID/PV-UUID tuples. The generic lab artifact therefore carries
+no invented storage UUIDs; a capsule-binding generator comes only after the
+frankensargo has a real anchor VG.
+
+The old nested-MBR userdata planner remains as compatibility/bootstrap
+research, not the final layout:
+
+```sh
+target/plan-layout /path/to/a/userdata-sized-file
+```
+
+The architecture and boot contract are in [`DESIGN.md`](DESIGN.md); the exact
+transaction protocol, role tags, manifest schema, and crash reconciliation are
+in [`docs/grey-goo-protocol.md`](docs/grey-goo-protocol.md). The host-only
+planner can exercise the synthetic ready-donor example without touching a
+phone:
+
+```sh
+target/plan-discovery \
+  --manifest examples/grey-goo-manifest-v1.example.json
+
+target/plan-absorb \
+  --manifest examples/grey-goo-manifest-v1.example.json \
+  --partition-id gpt:11111111-2222-4333-8444-555555555555/66666666-7777-4888-9999-aaaaaaaaaaaa \
+  --operation-uuid 01234567-89ab-4cde-8f01-23456789abcd
+```
+
+The first command emits the anchor-only and full-allowlist discovery stages.
+The second emits a hash-bound authorization plan and confirmation token.
+Neither emits a write command.
+
+## Frankensargo hardware bring-up
+
+Two sargos are in play. `dev-sargo` is the future daily driver and remains
+outside this project's target set. On 2026-07-11 it was used only as an
+intermediate SSH/USB host: no block-device or storage-layout operation targeted
+it, although temporary lab tools and traces were staged under `/var/tmp`.
+
+`frankensargo`, fastboot serial `99NAY1AZG1`, is the experimental target for
+this project.
+
+That downstream attempt exposed a sustained USB bulk-OUT failure in
+`dev-sargo`'s experimental host path. PocketBoot never started. The topology,
+isolation matrix, xHCI/usbmon evidence, cleanup state, and next controls are in
+the [dev-sargo USB host-mode failure handover](docs/dev-sargo-usb-host-failure-handover.md).
+
+Discovery on frankensargo starts read-only and with its explicit serial. At the
+2026-07-11 handover it was connected directly to the desktop for the next
+control:
+
+```sh
+bin/probe-fastboot --serial 99NAY1AZG1
+```
+
+Then the sequence is deliberately incremental:
+
+1. transiently boot the pinned generic lab image;
+2. capture serial, eMMC CID, complete GPT, slots, signatures, LP metadata, and
+   UART/pstore output;
+3. prove SysRq reset and stock-fastboot recovery;
+4. export and verify the initial host-side bootstrap plan;
+5. explicitly authorize only `userdata` as the anchor PV;
+6. create `ggmeta`, `boot-rescue`, critical LVs, and a small thin-data pool;
+7. cold-boot normal PocketBoot from the inactive Android boot slot;
+8. import and verify factory artifacts without touching their donors; and
+9. authorize each later donor independently, with a reboot while it is fenced
+   before releasing its extents for allocation.
+
+No guessed `/dev/mmcblk0pNN` name is ever authority. No `pvcreate`, `vgextend`,
+slot switch, reboot, flash, or serial write belongs in discovery.
+
+## Distro shapes
+
+- **PocketFed** is the first direct-filesystem root. It needs LVM in its dracut
+  image, a UKI/BLS publisher instead of `aboot-deploy`, and homed PAM enablement.
+- **Mobian**, **Duranium**, and eventually **BengalOS** fit naturally as thin
+  whole-disk LVs. PocketBoot scans their nested GPT boot partitions; their own
+  repart/sysupdate/verity layout can remain intact.
+- **Duranium/postmarketOS** currently builds systemd without homed/userdb, so
+  shared encrypted homes require a package rebuild and first-boot adaptation.
+
+The shared `home` filesystem is not the encryption boundary. It stores
+per-user LUKS2 `name.home` images managed by systemd-homed. Every participating
+OS also mounts the same thick `homed-state` LV at `/var/lib/systemd/home` so the
+identity records and signing keys agree. All installed roots are therefore in
+one trust domain.
+
+## Recovery facts
+
+- A VG spanning partitions on one eMMC adds capacity, not redundancy.
+- Thin metadata, its spare, `ggmeta`, rescue bootfs, home, and homed state stay
+  thick and pinned to the userdata anchor.
+- A read-only exposed thin LV still requires its thin-pool dependency; pool
+  activation is not claimed to be physically metadata-write-free. Pool health
+  and transaction IDs are observed around every normal activation.
+- PocketBoot provides 115200-baud UART, SysRq, root ADB, pstore/ramoops, and
+  userspace fastboot. These lab interfaces are intentionally unauthenticated.
+- Its default SysRq mask permits immediate reboot but not the complete
+  sync/remount sequence; enable the full mask only in the controlled lab image.
+- PocketBoot's userspace-fastboot staging limit is 256 MiB. Large artifacts are
+  streamed/imported from a booted takeover environment, not flashed through it.
+- Running Android dynamic-partition or factory-image tools against a donor
+  after absorption will destroy the VG. Restoring Android is a planned storage
+  transaction, not an incidental factory flash.

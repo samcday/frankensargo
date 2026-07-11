@@ -1,0 +1,84 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM=${0##*/}
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck disable=SC1091 # Resolved from the installed script location.
+. "$ROOT/lib/layout.sh"
+
+usage()
+{
+	cat <<EOF
+Usage: $PROGRAM [--boot-mib MIB] [--json | --sfdisk] DEVICE_OR_IMAGE
+
+Calculate a 512-byte-sector DOS/MBR table without modifying the target.
+The default output is a KEY=value plan. --sfdisk emits a script which may
+be reviewed and explicitly passed to sfdisk by the operator.
+EOF
+}
+
+die()
+{
+	printf '%s: %s\n' "$PROGRAM" "$*" >&2
+	exit 2
+}
+
+format='env'
+format_seen=0
+boot_mib=$LAYOUT_DEFAULT_BOOT_MIB
+boot_seen=0
+
+while [ "$#" -gt 0 ]; do
+	case $1 in
+		--boot-mib)
+			[ "$#" -ge 2 ] || die '--boot-mib requires an argument'
+			[ "$boot_seen" -eq 0 ] || die '--boot-mib may only be specified once'
+			boot_mib=$2
+			boot_seen=1
+			shift 2
+			;;
+		--boot-mib=*)
+			[ "$boot_seen" -eq 0 ] || die '--boot-mib may only be specified once'
+			boot_mib=${1#*=}
+			boot_seen=1
+			shift
+			;;
+		--json | --sfdisk)
+			[ "$format_seen" -eq 0 ] || die 'select only one output format'
+			case $1 in
+				--json) format=json ;;
+				--sfdisk) format=sfdisk ;;
+			esac
+			format_seen=1
+			shift
+			;;
+		--help | -h)
+			usage
+			exit 0
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			die "unknown option: $1"
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+[ "$#" -eq 1 ] || {
+	usage >&2
+	exit 2
+}
+
+layout_plan "$1" "$boot_mib" || exit 1
+
+case $format in
+	env) layout_print_env ;;
+	json) layout_print_json ;;
+	sfdisk) layout_print_sfdisk ;;
+esac

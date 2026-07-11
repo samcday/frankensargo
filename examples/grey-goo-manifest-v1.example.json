@@ -1,0 +1,124 @@
+{
+  "schema": "org.pocketboot.greygoo/1",
+  "generation": 17,
+  "previous_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "device": {
+    "uuid": "735f34bd-8842-4a35-a5bd-795e81145157",
+    "product": "sargo",
+    "fastboot_serial": "SYNTHETIC-SPARE-SARGO",
+    "emmc_cid": "150100445036444142001234567890ab",
+    "gpt_disk_guid": "11111111-2222-4333-8444-555555555555",
+    "inventory_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "capsule_binding": {
+    "anchor_partuuid": "22222222-3333-4444-8555-bbbbbbbbbbbb",
+    "vg_uuid": "VG0000-1111-2222-3333-4444-5555-666666"
+  },
+  "lvm": {
+    "vg_name": "franken",
+    "vg_uuid": "VG0000-1111-2222-3333-4444-5555-666666",
+    "vg_seqno": 23,
+    "anchor_pv_uuid": "PV0000-1111-2222-3333-4444-5555-666666",
+    "allowed_pvs": [
+      {
+        "partition_id": "gpt:11111111-2222-4333-8444-555555555555/22222222-3333-4444-8555-bbbbbbbbbbbb",
+        "partuuid": "22222222-3333-4444-8555-bbbbbbbbbbbb",
+        "pv_uuid": "PV0000-1111-2222-3333-4444-5555-666666"
+      }
+    ],
+    "thin_pool": {
+      "lv_uuid": "LV0000-1111-2222-3333-4444-5555-666666",
+      "chunk_bytes": "65536",
+      "transaction_id": "29",
+      "metadata_lv_uuid": "META00-1111-2222-3333-4444-5555-666666",
+      "metadata_spare_lv_uuid": "SPARE0-1111-2222-3333-4444-5555-666666"
+    }
+  },
+  "partitions": [
+    {
+      "id": "gpt:11111111-2222-4333-8444-555555555555/66666666-7777-4888-9999-aaaaaaaaaaaa",
+      "name": "system_b",
+      "classification": "candidate",
+      "firmware_gate_required": true,
+      "lp_extent_gate": {
+        "required": true,
+        "status": "satisfied",
+        "metadata_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "extent_graph_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "all_touching_extents_archived": true,
+        "archive_mappings_verified": true
+      },
+      "identity": {
+        "immutable": true,
+        "parent_disk_guid": "11111111-2222-4333-8444-555555555555",
+        "partuuid": "66666666-7777-4888-9999-aaaaaaaaaaaa",
+        "partlabel": "system_b"
+      },
+      "geometry": {
+        "immutable": true,
+        "start_lba": "1048576",
+        "sectors": "12582912",
+        "logical_sector_bytes": 512
+      },
+      "raw": {
+        "immutable": true,
+        "bytes": "6442450944",
+        "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "archive_object_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capacity": {
+        "donor_bytes": "6442450944",
+        "retained_allocated_bytes": "3221225472",
+        "metadata_growth_bytes": "268435456",
+        "reserve_bytes": "536870912",
+        "conservative_net_bytes": "2415919104"
+      },
+      "takeover": {
+        "state": "ready",
+        "planned_pv_uuid": "DONOR0-1111-2222-3333-4444-5555-666666",
+        "planned_pv_uuid_immutable": true,
+        "binding_sha256": "sha256:3d26af17fb6ab64d77d90e22b5d7a49bbcb3e271668ff4694a017be628402ac7"
+      }
+    }
+  ],
+  "objects": [
+    {
+      "id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "kind": "android-lp-container",
+      "bytes": "6442450944",
+      "source_partition_id": "gpt:11111111-2222-4333-8444-555555555555/66666666-7777-4888-9999-aaaaaaaaaaaa",
+      "immutable": true,
+      "local_lv_uuid": "ARC000-1111-2222-3333-4444-5555-666666",
+      "local_form": "sparse-thin-raw",
+      "verification": {
+        "source_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "destination_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "off_device_copies": [
+        {
+          "copy_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+          "location_class": "off-device",
+          "medium": "synthetic-host-backup",
+          "bytes": "6442450944",
+          "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "verified": true
+        }
+      ]
+    }
+  ],
+  "firmware_gate": {
+    "status": "satisfied",
+    "bundle_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "off_device_verified": true,
+    "extractor": {
+      "name": "droid-juicer",
+      "config": "google,sargo.toml",
+      "commit": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "load_test": {
+      "kernel_build": "synthetic-sdm670-grey-goo-test",
+      "passed": true
+    }
+  },
+  "active_operation": null
+}
