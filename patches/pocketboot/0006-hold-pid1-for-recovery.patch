@@ -1,0 +1,25 @@
+diff --git a/src/main.rs b/src/main.rs
+index ff68b4716e0cc05a1285dbaef72b42717cf351d8..01056522e96e8a4d245c083773f1b097d6a40bab 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -47,10 +47,17 @@ const DEFAULT_DEVICE_NAME: &str = "Pocketboot Device";
+ const DEFAULT_DEVICE_DETAIL: &str = "LinuxBoot environment";
+ 
+ fn main() {
+-    if let Err(err) = runtime::block_on(run()) {
+-        println!("pocketboot error: {}", err);
+-        thread::sleep(Duration::from_secs(1));
++    match runtime::block_on(run()) {
++        Ok(()) => println!("pocketboot coordinator exited; holding PID 1 for recovery"),
++        Err(err) => println!("pocketboot error: {err}; holding PID 1 for recovery"),
++    }
++
++    // Returning from PID 1 panics the kernel. Successful kexec and reboot
++    // actions do not return, so any return here is a recovery state: keep the
++    // UART getty and Magic SysRq usable even if the USB gadget has torn down.
++    loop {
++        thread::sleep(Duration::from_secs(60));
+     }
+ }
+ 
+ async fn run() -> Result<()> {

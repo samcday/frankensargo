@@ -250,13 +250,21 @@ change ADB, mass storage, fastboot host-to-device downloads, response packets,
 or any storage command. This combined version still requires hardware
 validation before trusting a large readback.
 
-The complete five-patch tree was cross-built inside the Deck's
+The complete six-patch tree was cross-built inside the Deck's
 `fedora-latest` distrobox as tree
-`44064004402a606c642ee0be201e9bef17d6eb50`. The resulting image is
+`07bf6258f893d89b9c11c5db8063632246c1b0a4`. The resulting image is
 `/home/deck/frankensargo-lab/pocketboot-current/pocketboot-sargo-lab.img`,
 SHA-256
-`c8bb396f544db569443ae1d69377b352a0c0716fd2aa2adb90fa9b98520cf9bf`.
+`ad37af96fe9620e3600337f0dfe8a76fe47abcc48013398fb72ec8919be05cd8`.
 That build success is not a hardware readback result.
+
+The failed queue-only probe also exposed a separate recovery defect: a fatal
+fastboot error let PocketBoot PID 1 return, so Linux panicked while tearing
+down the gadget. The final
+[`0006-hold-pid1-for-recovery.patch`](../patches/pocketboot/0006-hold-pid1-for-recovery.patch)
+keeps PID 1 alive after any coordinator return. Successful kexec and reboot
+actions do not return; the hold path exists so UART getty and Magic SysRq stay
+available after a failed or empty boot attempt.
 
 Across all of these tests, `userdata` retained its original identity and
 content state: it was only read, never mounted read-write, erased, formatted,
