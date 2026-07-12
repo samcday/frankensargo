@@ -105,8 +105,34 @@ make check
 bin/source-status --remote
 bin/build-pocketboot --prepare-only
 bin/build-pocketboot
-(cd out/pocketboot && sha256sum -c pocketboot-sargo-lab.img.sha256)
+python3 lib/pocketboot_bundle.py verify --manifest \
+  out/pocketboot/pocketboot-sargo-lab.img.bundle.json
 ```
+
+The opt-in no-ACM control keeps the exact same 0001-through-current patch
+tree and publishes under a separate directory and basename:
+
+```sh
+bin/build-pocketboot --no-acm --prepare-only
+bin/build-pocketboot --no-acm
+python3 lib/pocketboot_bundle.py verify --manifest \
+  out/pocketboot-noacm/pocketboot-sargo-lab-noacm.img.bundle.json
+```
+
+It post-processes only the two Android-v2 cmdline fields of the unpublished
+temporary image, requiring exactly one `pocketboot.acm` token and canonical
+padding, and refuses a known AVB-footer-sealed artifact. Its provenance records
+the unchanged base/effective source tree,
+base/effective cmdlines, parent/result hashes, exact changed spans, and proof
+that every non-cmdline byte is identical. The default build remains unchanged.
+`build-pocketboot-bound --no-acm` composes the same profile with the observed
+VG/PV binding inside its journaled, restored one-shot source edit.
+
+Generic builds refuse every pre-existing final bundle path. All members are
+hashed and fsynced before they are linked into place, and the hash-bound
+`.bundle.json` completion manifest is published last. A killed build can leave
+partial files but no completion manifest; consumers must require the manifest
+verifier above rather than accepting a checksum sidecar by itself.
 
 `make check` uses regular sparse files. `build-pocketboot` builds files only
 and never runs fastboot; the full invocation writes the image, checksum, and
@@ -123,6 +149,13 @@ leaves LVM discovery disabled. It does **not** yet read `ggmeta` or validate the
 manifest's PARTUUID/PV-UUID tuples. The generic lab artifact therefore carries
 no invented storage UUIDs; a capsule-binding generator comes only after the
 frankensargo has a real anchor VG.
+
+The stack also implements the raw, non-PTY subset of standard ADB `shell_v2`.
+Bootstrap and Duranium import commands use one shared exact-serial host client
+that proves fresh separated stdout/stderr and a typed exit frame, then rejects
+legacy status zero and truncated streams on every argv. This support is in
+patch `0013-adb-shell-v2-status.patch`; it has passed the host and PocketBoot
+test suites but is not present in either previously staged hardware image.
 
 The old nested-MBR userdata planner remains as compatibility/bootstrap
 research, not the final layout:
@@ -270,17 +303,33 @@ physical `ttyUSB1` UART produced an unauthenticated root `/bin/sh` on
 handover records the reproducible distrobox commands, stable topology path,
 and the deliberate physical-root-shell security boundary.
 
+An earlier bounded-read control ended in a target-side ACM/configfs teardown
+deadlock after a USB `EPROTO`. The latest safe-teardown control reproduced the
+same transfer failure but dismantled the gadget cleanly and retained a
+respawning UART getty; `userdata` was still read-only and no mutating LVM
+command had run. Frankensargo currently needs a physical reset into ABL.
+Two fresh-boot controls are staged on the Deck: a no-ACM image, SHA-256
+`3e5fa16a…`, and an ACM plus DWC3 `tx-fifo-resize` plus safe-teardown image,
+SHA-256 `4b628a5c…`.
+The latter includes a respawning UART getty, read-only UMS and full SysRq. The
+exact paths, hashes, patch trees, observed transfer boundary, teardown stack
+and one-boot comparison rule are in the
+[Steam Deck handover](docs/steamdeck-usbip-handover.md). Neither image is yet
+evidence that large USB reads work.
+
 The remaining sequence is deliberately incremental:
 
-1. map the snapshot into a real manifest with the zero-GUID plus CID binding;
-2. capture content signatures, LP metadata, and UART/pstore;
-3. prove SysRq reset and stock-fastboot recovery;
-4. export and verify the initial host-side bootstrap plan;
-5. explicitly authorize only `userdata` as the anchor PV;
-6. create `ggmeta`, `boot-rescue`, critical LVs, and a small thin-data pool;
-7. cold-boot normal PocketBoot from the inactive Android boot slot;
-8. import and verify factory artifacts without touching their donors; and
-9. authorize each later donor independently, with a reboot while it is fenced
+1. use one fresh ABL boot per USB control and prove a repeatable large PBREAD;
+2. recapture the canonical inventory and make a complete, independently
+   rehashed 53,648,801,280-byte off-device `userdata` backup;
+3. run the hardened takeover executor through its read-only step-0 preflight;
+4. export and verify the exact hash-bound bootstrap plan and explicit consent;
+5. authorize only `userdata` as the anchor PV and checkpoint every mutation;
+6. create `ggmeta`, `boot-rescue`, critical LVs, and the thin-data pool;
+7. import and locally hash-verify Duranium before publishing its disk LV;
+8. build the observed-UUID-bound PocketBoot capsule and boot Duranium; and
+9. import factory artifacts without touching donors, then authorize each later
+   donor independently, with a reboot while it is fenced
    before releasing its extents for allocation.
 
 No guessed `/dev/mmcblk0pNN` name is ever authority. No `pvcreate`, `vgextend`,

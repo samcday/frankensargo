@@ -1,0 +1,587 @@
+diff --git a/src/adb.rs b/src/adb.rs
+index b0ce1ed..96dbf57 100644
+--- a/src/adb.rs
++++ b/src/adb.rs
+@@ -9,11 +9,11 @@ use std::{
+         unix::{
+             ffi::{OsStrExt, OsStringExt},
+             fs::{MetadataExt, PermissionsExt},
+-            process::CommandExt,
++            process::{CommandExt, ExitStatusExt},
+         },
+     },
+     path::{Path, PathBuf},
+-    process::{Child, ChildStdin, Command, Stdio},
++    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
+     sync::{
+         Arc, Condvar, Mutex,
+         atomic::{AtomicBool, AtomicU32, Ordering},
+@@ -48,6 +48,8 @@ const MAX_PAYLOAD_V1: u32 = 4 * 1024;
+ const MAX_PAYLOAD: u32 = 1024 * 1024;
+ const HEADER_LEN: usize = 24;
+ const SHELL_CHUNK: usize = 4 * 1024;
++const SHELL_V2_HEADER_LEN: usize = 5;
++const SHELL_V2_CHUNK: usize = MAX_PAYLOAD_V1 as usize - SHELL_V2_HEADER_LEN;
+ const SYNC_CHUNK: usize = 64 * 1024;
+ const READ_TIMEOUT: Duration = Duration::from_millis(500);
+ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+@@ -57,6 +59,13 @@ const SHELL_SERVICE: &str = "shell:";
+ const EXEC_SERVICE: &str = "exec:";
+ const SYNC_SERVICE: &str = "sync:";
+ 
++const SHELL_V2_STDIN: u8 = 0;
++const SHELL_V2_STDOUT: u8 = 1;
++const SHELL_V2_STDERR: u8 = 2;
++const SHELL_V2_EXIT: u8 = 3;
++const SHELL_V2_CLOSE_STDIN: u8 = 4;
++const SHELL_V2_WINDOW_SIZE: u8 = 5;
++
+ const SYNC_STAT: &[u8; 4] = b"STAT";
+ const SYNC_LIST: &[u8; 4] = b"LIST";
+ const SYNC_SEND: &[u8; 4] = b"SEND";
+@@ -473,6 +482,7 @@ impl PacketWriter {
+ 
+ enum AdbSession {
+     Shell(ShellSession),
++    ShellV2(ShellV2Session),
+     Exec(RawCommandSession),
+     Sync(SyncSession),
+ }
+@@ -488,6 +498,9 @@ impl AdbSession {
+             AdbService::Shell(command) => {
+                 ShellSession::spawn(local_id, remote_id, command, writer).map(AdbSession::Shell)
+             }
++            AdbService::ShellV2(command) => {
++                ShellV2Session::spawn(local_id, remote_id, command, writer).map(AdbSession::ShellV2)
++            }
+             AdbService::Exec(command) => {
+                 RawCommandSession::spawn(local_id, remote_id, command, writer).map(AdbSession::Exec)
+             }
+@@ -500,6 +513,7 @@ impl AdbSession {
+     fn kind(&self) -> &'static str {
+         match self {
+             AdbSession::Shell(_) => "shell",
++            AdbSession::ShellV2(_) => "shell-v2",
+             AdbSession::Exec(_) => "exec",
+             AdbSession::Sync(_) => "sync",
+         }
+@@ -508,6 +522,7 @@ impl AdbSession {
+     fn remote_id(&self) -> u32 {
+         match self {
+             AdbSession::Shell(session) => session.remote_id,
++            AdbSession::ShellV2(session) => session.remote_id,
+             AdbSession::Exec(session) => session.remote_id,
+             AdbSession::Sync(session) => session.remote_id,
+         }
+@@ -520,6 +535,7 @@ impl AdbSession {
+     fn allow_output(&self) {
+         match self {
+             AdbSession::Shell(session) => session.allow_output(),
++            AdbSession::ShellV2(session) => session.allow_output(),
+             AdbSession::Exec(session) => session.allow_output(),
+             AdbSession::Sync(session) => session.allow_output(),
+         }
+@@ -528,6 +544,7 @@ impl AdbSession {
+     fn acknowledge_output(&self) {
+         match self {
+             AdbSession::Shell(session) => session.acknowledge_output(),
++            AdbSession::ShellV2(session) => session.acknowledge_output(),
+             AdbSession::Exec(session) => session.acknowledge_output(),
+             AdbSession::Sync(session) => session.acknowledge_output(),
+         }
+@@ -536,6 +553,7 @@ impl AdbSession {
+     fn write_input(&mut self, data: &[u8]) -> io::Result<()> {
+         match self {
+             AdbSession::Shell(session) => session.write_input(data),
++            AdbSession::ShellV2(session) => session.write_input(data),
+             AdbSession::Exec(session) => session.write_input(data),
+             AdbSession::Sync(session) => session.write_input(data),
+         }
+@@ -544,6 +562,7 @@ impl AdbSession {
+     fn close_from_host(&mut self, writer: &PacketWriter) -> io::Result<()> {
+         match self {
+             AdbSession::Shell(session) => session.close_from_host(writer),
++            AdbSession::ShellV2(session) => session.close_from_host(writer),
+             AdbSession::Exec(session) => session.close_from_host(writer),
+             AdbSession::Sync(session) => session.close_from_host(writer),
+         }
+@@ -552,6 +571,7 @@ impl AdbSession {
+     fn close_from_device(&mut self, writer: &PacketWriter) -> io::Result<()> {
+         match self {
+             AdbSession::Shell(session) => session.close_from_device(writer),
++            AdbSession::ShellV2(session) => session.close_from_device(writer),
+             AdbSession::Exec(session) => session.close_from_device(writer),
+             AdbSession::Sync(session) => session.close_from_device(writer),
+         }
+@@ -637,6 +657,126 @@ impl Drop for ShellSession {
+     }
+ }
+ 
++struct ShellV2Session {
++    local_id: u32,
++    remote_id: u32,
++    stdin: Option<ChildStdin>,
++    input_buffer: Vec<u8>,
++    child_pid: u32,
++    child_running: Arc<AtomicBool>,
++    output: Arc<OutputFlow>,
++    output_thread: Option<thread::JoinHandle<()>>,
++}
++
++impl ShellV2Session {
++    fn spawn(
++        local_id: u32,
++        remote_id: u32,
++        command: String,
++        writer: PacketWriter,
++    ) -> io::Result<Self> {
++        let (stdin, stdout, stderr, child) = spawn_shell_v2_command(&command)?;
++        let child_pid = child.id();
++        let child_running = Arc::new(AtomicBool::new(true));
++        let output = Arc::new(OutputFlow::new());
++        let thread_child_running = child_running.clone();
++        let thread_output = output.clone();
++        let output_thread = thread::Builder::new()
++            .name(format!("pocketboot-adb-shell-v2-{local_id}"))
++            .spawn(move || {
++                run_shell_v2_output(
++                    stdout,
++                    stderr,
++                    child,
++                    writer,
++                    local_id,
++                    remote_id,
++                    thread_child_running,
++                    thread_output,
++                )
++            })?;
++
++        Ok(Self {
++            local_id,
++            remote_id,
++            stdin: Some(stdin),
++            input_buffer: Vec::new(),
++            child_pid,
++            child_running,
++            output,
++            output_thread: Some(output_thread),
++        })
++    }
++
++    fn allow_output(&self) {
++        self.output.allow_one_write();
++    }
++
++    fn acknowledge_output(&self) {
++        self.output.allow_one_write();
++    }
++
++    fn write_input(&mut self, data: &[u8]) -> io::Result<()> {
++        self.input_buffer.extend_from_slice(data);
++        for packet in parse_shell_v2_input(&mut self.input_buffer)? {
++            match packet {
++                ShellV2Input::Stdin(data) => {
++                    let Some(stdin) = self.stdin.as_mut() else {
++                        return Err(io::Error::new(
++                            io::ErrorKind::BrokenPipe,
++                            "adb shell-v2 stdin is closed",
++                        ));
++                    };
++                    stdin.write_all(&data)?;
++                }
++                ShellV2Input::CloseStdin => {
++                    self.stdin.take();
++                }
++                ShellV2Input::WindowSize(_) => {
++                    // Bootstrap commands explicitly request raw (-T) mode, so
++                    // a window-size update has no process-side effect.
++                }
++            }
++        }
++        Ok(())
++    }
++
++    fn close_from_host(&mut self, writer: &PacketWriter) -> io::Result<()> {
++        let send_close = self.close();
++        if send_close {
++            writer.send(A_CLSE, self.local_id, self.remote_id, &[])?;
++        }
++        Ok(())
++    }
++
++    fn close_from_device(&mut self, writer: &PacketWriter) -> io::Result<()> {
++        let send_close = self.close();
++        if send_close {
++            writer.send(A_CLSE, self.local_id, self.remote_id, &[])?;
++        }
++        Ok(())
++    }
++
++    fn close(&mut self) -> bool {
++        self.stdin.take();
++        if self.child_running.swap(false, Ordering::AcqRel) {
++            terminate_process_group(self.child_pid);
++        }
++        self.output.close()
++    }
++}
++
++impl Drop for ShellV2Session {
++    fn drop(&mut self) {
++        self.close();
++        if let Some(thread) = self.output_thread.take()
++            && thread.join().is_err()
++        {
++            tracing::warn!(pid = self.child_pid, "adb shell-v2 output thread panicked");
++        }
++    }
++}
++
+ struct RawCommandSession {
+     local_id: u32,
+     remote_id: u32,
+@@ -1093,6 +1233,84 @@ struct OutputState {
+     closed: bool,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum ShellV2Input {
++    Stdin(Vec<u8>),
++    CloseStdin,
++    WindowSize(Vec<u8>),
++}
++
++fn parse_shell_v2_input(buffer: &mut Vec<u8>) -> io::Result<Vec<ShellV2Input>> {
++    let mut packets = Vec::new();
++    loop {
++        if buffer.len() < SHELL_V2_HEADER_LEN {
++            return Ok(packets);
++        }
++        let id = buffer[0];
++        let length = u32::from_le_bytes(buffer[1..5].try_into().unwrap()) as usize;
++        if length > MAX_PAYLOAD as usize {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "adb shell-v2 inner packet is too large",
++            ));
++        }
++        let total = SHELL_V2_HEADER_LEN.checked_add(length).ok_or_else(|| {
++            io::Error::new(
++                io::ErrorKind::InvalidData,
++                "adb shell-v2 inner packet length overflow",
++            )
++        })?;
++        if buffer.len() < total {
++            return Ok(packets);
++        }
++        let payload = buffer[SHELL_V2_HEADER_LEN..total].to_vec();
++        buffer.drain(..total);
++        let packet = match id {
++            SHELL_V2_STDIN => ShellV2Input::Stdin(payload),
++            SHELL_V2_CLOSE_STDIN if payload.is_empty() => ShellV2Input::CloseStdin,
++            SHELL_V2_WINDOW_SIZE => ShellV2Input::WindowSize(payload),
++            SHELL_V2_CLOSE_STDIN => {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    "adb shell-v2 close-stdin packet has a payload",
++                ));
++            }
++            _ => {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    format!("unsupported adb shell-v2 input id {id}"),
++                ));
++            }
++        };
++        packets.push(packet);
++    }
++}
++
++fn shell_v2_packet(id: u8, payload: &[u8]) -> io::Result<Vec<u8>> {
++    let length = u32::try_from(payload.len()).map_err(|_| {
++        io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "adb shell-v2 payload length overflows u32",
++        )
++    })?;
++    let mut packet = Vec::with_capacity(SHELL_V2_HEADER_LEN + payload.len());
++    packet.push(id);
++    packet.extend_from_slice(&length.to_le_bytes());
++    packet.extend_from_slice(payload);
++    Ok(packet)
++}
++
++fn shell_v2_exit_code(status: ExitStatus) -> u8 {
++    if let Some(code) = status.code() {
++        return u8::try_from(code).unwrap_or(1);
++    }
++    status
++        .signal()
++        .and_then(|signal| u8::try_from(signal).ok())
++        .map(|signal| 0x80 | signal)
++        .unwrap_or(1)
++}
++
+ impl OutputFlow {
+     fn new() -> Self {
+         Self {
+@@ -1228,6 +1446,99 @@ fn run_raw_command_output(
+     }
+ }
+ 
++fn run_shell_v2_reader(mut reader: File, id: u8, output: mpsc::SyncSender<(u8, Vec<u8>)>) {
++    let mut buffer = [0; SHELL_V2_CHUNK];
++    loop {
++        let read = match read_fd(&mut reader, &mut buffer) {
++            Ok(0) => return,
++            Ok(read) => read,
++            Err(err) => {
++                tracing::debug!(id, error = ?err, "adb shell-v2 child output read failed");
++                return;
++            }
++        };
++        if output.send((id, buffer[..read].to_vec())).is_err() {
++            return;
++        }
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++fn run_shell_v2_output(
++    stdout: File,
++    stderr: File,
++    mut child: Child,
++    writer: PacketWriter,
++    local_id: u32,
++    remote_id: u32,
++    child_running: Arc<AtomicBool>,
++    output: Arc<OutputFlow>,
++) {
++    // Bound queued output so a slow or disconnected USB host cannot turn
++    // unbounded subprocess output into unbounded initramfs memory use.
++    let (sender, receiver) = mpsc::sync_channel(2);
++    let stdout_sender = sender.clone();
++    let stdout_thread =
++        thread::spawn(move || run_shell_v2_reader(stdout, SHELL_V2_STDOUT, stdout_sender));
++    let stderr_thread = thread::spawn(move || run_shell_v2_reader(stderr, SHELL_V2_STDERR, sender));
++
++    let mut stream_open = true;
++    while let Ok((id, data)) = receiver.recv() {
++        let packet = match shell_v2_packet(id, &data) {
++            Ok(packet) => packet,
++            Err(err) => {
++                tracing::debug!(local_id, remote_id, error = ?err, "adb shell-v2 frame failed");
++                stream_open = false;
++                break;
++            }
++        };
++        if !send_stream_payload(&writer, local_id, remote_id, &output, &packet) {
++            stream_open = false;
++            break;
++        }
++    }
++
++    if !stream_open {
++        terminate_process_group(child.id());
++    }
++    drop(receiver);
++    if stdout_thread.join().is_err() {
++        tracing::warn!(local_id, remote_id, "adb shell-v2 stdout thread panicked");
++        stream_open = false;
++    }
++    if stderr_thread.join().is_err() {
++        tracing::warn!(local_id, remote_id, "adb shell-v2 stderr thread panicked");
++        stream_open = false;
++    }
++
++    let status = child.wait();
++    child_running.store(false, Ordering::Release);
++    let exit_code = match status {
++        Ok(status) => shell_v2_exit_code(status),
++        Err(err) => {
++            tracing::debug!(local_id, remote_id, error = ?err, "adb shell-v2 wait failed");
++            1
++        }
++    };
++
++    if stream_open {
++        let exit_packet = shell_v2_packet(SHELL_V2_EXIT, &[exit_code])
++            .expect("one-byte shell-v2 exit packet is always valid");
++        stream_open = send_stream_payload(&writer, local_id, remote_id, &output, &exit_packet);
++    }
++
++    // Do not close the outer ADB stream until the host acknowledges the exit
++    // frame.  A missing acknowledgement instead causes Drop/teardown to wake
++    // this waiter, preserving truncation as a host-side failure.
++    if stream_open
++        && output.wait_for_write_credit()
++        && output.close()
++        && let Err(err) = writer.send(A_CLSE, local_id, remote_id, &[])
++    {
++        tracing::debug!(local_id, remote_id, error = ?err, "adb shell-v2 close send failed");
++    }
++}
++
+ fn run_sync_output(
+     responses: mpsc::Receiver<SyncResponse>,
+     writer: PacketWriter,
+@@ -1404,7 +1715,7 @@ fn checksum(payload: &[u8]) -> u32 {
+ }
+ 
+ fn connection_banner() -> String {
+-    "recovery::ro.product.name=pocketboot;ro.product.model=pocketboot;ro.product.device=pocketboot;features=".to_string()
++    "recovery::ro.product.name=pocketboot;ro.product.model=pocketboot;ro.product.device=pocketboot;features=shell_v2".to_string()
+ }
+ 
+ fn service_name(payload: &[u8]) -> io::Result<&str> {
+@@ -1416,6 +1727,7 @@ fn service_name(payload: &[u8]) -> io::Result<&str> {
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ enum AdbService {
+     Shell(Option<String>),
++    ShellV2(String),
+     Exec(String),
+     Sync,
+ }
+@@ -1430,6 +1742,21 @@ fn adb_service(service: &str) -> Option<AdbService> {
+     if let Some(command) = service.strip_prefix(EXEC_SERVICE) {
+         return Some(AdbService::Exec(command.to_string()));
+     }
++    if let Some((descriptor, command)) = service.split_once(':') {
++        let mut arguments = descriptor.split(',');
++        if arguments.next() == Some("shell") {
++            let arguments: Vec<_> = arguments.collect();
++            let shell_v2 = arguments.contains(&"v2");
++            let raw = arguments.contains(&"raw");
++            let pty = arguments.contains(&"pty");
++            let known = arguments
++                .iter()
++                .all(|argument| matches!(*argument, "v2" | "raw") || argument.starts_with("TERM="));
++            if shell_v2 && raw && !pty && known {
++                return Some(AdbService::ShellV2(command.to_string()));
++            }
++        }
++    }
+     service
+         .strip_prefix(SHELL_SERVICE)
+         .map(|command| AdbService::Shell(Some(command.to_string())))
+@@ -1509,6 +1836,46 @@ fn spawn_raw_command(command: &str) -> io::Result<(ChildStdin, File, Child)> {
+     Ok((stdin, output_reader, child))
+ }
+ 
++fn spawn_shell_v2_command(command: &str) -> io::Result<(ChildStdin, File, File, Child)> {
++    let (stdout_reader, stdout_writer) = open_pipe()?;
++    let (stderr_reader, stderr_writer) = open_pipe()?;
++
++    let mut shell = Command::new(SHELL);
++    if command.is_empty() {
++        shell.arg("-i");
++    } else {
++        shell.arg("-c").arg(command);
++    }
++    shell
++        .env("HOME", "/")
++        .env("PATH", "/bin:/sbin:/usr/bin:/usr/sbin")
++        .env("TERM", "linux")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::from(stdout_writer))
++        .stderr(Stdio::from(stderr_writer));
++
++    unsafe {
++        shell.pre_exec(move || {
++            if libc::setsid() < 0 {
++                return Err(io::Error::last_os_error());
++            }
++            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
++            Ok(())
++        });
++    }
++
++    let mut child = shell
++        .spawn()
++        .map_err(|err| io::Error::new(err.kind(), format!("spawn {SHELL}: {err}")))?;
++    let stdin = child.stdin.take().ok_or_else(|| {
++        io::Error::new(
++            io::ErrorKind::BrokenPipe,
++            "spawned adb shell-v2 without stdin",
++        )
++    })?;
++    Ok((stdin, stdout_reader, stderr_reader, child))
++}
++
+ fn open_pipe() -> io::Result<(File, File)> {
+     let mut fds = [0; 2];
+     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+@@ -1839,6 +2206,73 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn advertises_and_recognizes_raw_shell_v2_service() {
++        assert!(connection_banner().ends_with("features=shell_v2"));
++        assert_eq!(
++            adb_service("shell,v2,TERM=xterm-256color,raw:exit 23"),
++            Some(AdbService::ShellV2("exit 23".to_string()))
++        );
++        assert_eq!(
++            adb_service("shell,v2,raw:"),
++            Some(AdbService::ShellV2(String::new()))
++        );
++    }
++
++    #[test]
++    fn rejects_unimplemented_or_ambiguous_shell_v2_modes() {
++        assert_eq!(adb_service("shell,v2,pty:id"), None);
++        assert_eq!(adb_service("shell,v2,raw,pty:id"), None);
++        assert_eq!(adb_service("shell,v2,raw,surprise:id"), None);
++    }
++
++    #[test]
++    fn shell_v2_frames_streams_and_nonzero_exit_out_of_band() {
++        assert_eq!(
++            shell_v2_packet(SHELL_V2_STDOUT, b"exit=0\n").unwrap(),
++            b"\x01\x07\x00\x00\x00exit=0\n"
++        );
++        let status = Command::new(SHELL)
++            .args(["-c", "exit 23"])
++            .status()
++            .unwrap();
++        assert_eq!(shell_v2_exit_code(status), 23);
++        assert_eq!(
++            shell_v2_packet(SHELL_V2_EXIT, &[23]).unwrap(),
++            b"\x03\x01\x00\x00\x00\x17"
++        );
++    }
++
++    #[test]
++    fn shell_v2_input_parser_handles_fragmentation_and_close() {
++        let mut buffer = b"\x00\x03\x00".to_vec();
++        assert!(parse_shell_v2_input(&mut buffer).unwrap().is_empty());
++        buffer.extend_from_slice(b"\x00\x00abc\x04\x00\x00\x00\x00");
++        assert_eq!(
++            parse_shell_v2_input(&mut buffer).unwrap(),
++            vec![
++                ShellV2Input::Stdin(b"abc".to_vec()),
++                ShellV2Input::CloseStdin
++            ]
++        );
++        assert!(buffer.is_empty());
++    }
++
++    #[test]
++    fn shell_v2_input_parser_rejects_bad_id_and_oversize() {
++        let mut bad_id = b"\x03\x00\x00\x00\x00".to_vec();
++        assert_eq!(
++            parse_shell_v2_input(&mut bad_id).unwrap_err().kind(),
++            io::ErrorKind::InvalidData
++        );
++        let mut oversized = vec![SHELL_V2_STDIN];
++        oversized.extend_from_slice(&(MAX_PAYLOAD + 1).to_le_bytes());
++        assert_eq!(
++            parse_shell_v2_input(&mut oversized).unwrap_err().kind(),
++            io::ErrorKind::InvalidData
++        );
++    }
++
+     #[test]
+     fn recognizes_exec_service() {
+         assert_eq!(

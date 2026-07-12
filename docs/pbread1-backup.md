@@ -20,6 +20,10 @@ other phone write.
 - Keep at least two userdata sizes plus working reserve free. The controller
   retains verified chunks until the assembled raw image is independently
   verified, and quarantines inconsistent files rather than overwriting them.
+- Use a private run path. The controller creates and requires the run directory
+  and every subdirectory at mode `0700`; locks, manifests, chunks and the raw
+  image are `0600`. It rejects an existing permissive directory or lock instead
+  of silently publishing userdata through the host's umask.
 
 The current exact userdata geometry is 53,648,801,280 bytes, so the fixed
 64 MiB plan has 799 full chunks and one final chunk: 800 chunks total. The

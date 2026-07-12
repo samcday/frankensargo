@@ -513,7 +513,7 @@ index 8652e5ae504b2b3b46c32829b888950b621a38fd..5aad661bde2fd23054a1d64d10bf5503
 +                );
 +                continue;
 +            };
-+            if live_compatibles.iter().any(|live| live == first) {
++            if live_compatibles.first() == Some(first) {
 +                tracing::info!(index, compatible = first, "selected matching UKI .dtbauto");
 +                return Some(candidate);
 +            }
@@ -1654,8 +1654,8 @@ index 8652e5ae504b2b3b46c32829b888950b621a38fd..5aad661bde2fd23054a1d64d10bf5503
 +    fn uki_load_resolution_selects_first_matching_dtbauto_then_falls_back() {
 +        let malformed = b"not a DTB".to_vec();
 +        let later_compatible =
-+            kexec::test_fdt_with_root_compatibles(&["vendor,other", "google,sargo"]);
-+        let matching = kexec::test_fdt_with_root_compatibles(&["qcom,sdm670"]);
++            kexec::test_fdt_with_root_compatibles(&["qcom,sdm670", "google,sargo"]);
++        let matching = kexec::test_fdt_with_root_compatibles(&["google,sargo"]);
 +        let fallback = kexec::test_fdt_with_root_compatibles(&["fallback,board"]);
 +        let live = kexec::test_fdt_with_root_compatibles(&["google,sargo", "qcom,sdm670"]);
 +        let image = test_pe_sections(&[
@@ -6700,4 +6700,3 @@ index aa9f72d57a8ec01d4f0ef3e19888da2ca65cc1ba..524494463c43244a20d872d6f6c3147b
          XtaskCommand::Preboot(args) => commands::preboot::run(args),
          XtaskCommand::Bootimg(args) => commands::bootimg::run(args),
          XtaskCommand::Qemu(args) => commands::qemu::run(args),
-

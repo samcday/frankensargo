@@ -48,7 +48,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..a591ec24e72d50a9f2b4edb55791a535a032651e
 --- /dev/null
 +++ b/src/fastboot/commands/pbread1.rs
-@@ -0,0 +1,1303 @@
+@@ -0,0 +1,1313 @@
 +use std::{
 +    fs::{self, File},
 +    io::{self, Read, Seek, SeekFrom, Write},
@@ -608,15 +608,14 @@ index 0000000000000000000000000000000000000000..a591ec24e72d50a9f2b4edb55791a535
 +        return Err(invalid_data("GPT label is truncated"));
 +    }
 +    let mut units = Vec::new();
-+    let mut ended = false;
 +    for pair in raw.chunks_exact(2) {
 +        let unit = u16::from_le_bytes([pair[0], pair[1]]);
 +        if unit == 0 {
-+            ended = true;
-+            continue;
-+        }
-+        if ended {
-+            return Err(invalid_data("GPT label has nonzero data after NUL"));
++            // Android factory GPTs use the name as a NUL-terminated UTF-16
++            // string and may leave 0xaf fill in the remainder of the field.
++            // Linux exposes only the prefix as PARTNAME, so bind that exact
++            // prefix to the independently checked uevent value below.
++            break;
 +        }
 +        units.push(unit);
 +    }
@@ -1110,6 +1109,17 @@ index 0000000000000000000000000000000000000000..a591ec24e72d50a9f2b4edb55791a535
 +            }
 +        );
 +        assert!(resolve_partuuid(&tree.paths, "db04e71311c34d68bec28cc483bd3890").is_err());
++    }
++
++    #[test]
++    fn decodes_android_gpt_name_with_legacy_tail_fill() {
++        let mut raw = [0xaf; 72];
++        for (index, unit) in "userdata".encode_utf16().enumerate() {
++            raw[index * 2..index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
++        }
++        raw[16..18].copy_from_slice(&0_u16.to_le_bytes());
++
++        assert_eq!(decode_gpt_label(&raw).unwrap(), "userdata");
 +    }
 +
 +    #[test]

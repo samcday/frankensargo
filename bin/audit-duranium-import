@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""Audit one derived Duranium disk before importing it into its thin LV."""
+
+from __future__ import annotations
+
+import argparse
+import decimal as decimal_module
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+
+FORMAT = "org.frankensargo.duranium-import-audit/1"
+PROVENANCE_FORMAT = "frankensargo.duranium-derived-disk.v1"
+ADAPTER_FORMAT = "frankensargo.duranium-lvm-adapter.v1"
+DEFAULT_VIRTUAL_BYTES = 20 * 1024 * 1024 * 1024
+DEFAULT_POOL_BYTES = 20 * 1024 * 1024 * 1024
+DEFAULT_CHUNK_BYTES = 256 * 1024
+DEFAULT_MAX_WRITE_BYTES = 64 * 1024 * 1024
+DEFAULT_MINIMUM_POOL_FREE_BYTES = 16 * 1024 * 1024 * 1024
+DEFAULT_MAXIMUM_POOL_METADATA_PERCENT = "75.00"
+MAX_METADATA_BYTES = 4 * 1024 * 1024
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+LVM_UUID_RE = re.compile(
+    r"[A-Za-z0-9]{6}(?:-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}\Z"
+)
+REQUIRED_CMDLINE = [
+    "root=dissect",
+    "mount.usr=dissect",
+    "sysrq_always_enabled=1",
+    "usrhash=<sha256>",
+]
+
+
+class AuditError(RuntimeError):
+    pass
+
+
+def fail(message: str) -> "None":
+    raise AuditError(message)
+
+
+def checked_positive(kind: str, value: int) -> int:
+    if value <= 0:
+        fail(f"{kind} must be positive")
+    return value
+
+
+def checked_metadata_percent(kind: str, value: str) -> str:
+    try:
+        parsed = decimal_module.Decimal(value)
+    except decimal_module.InvalidOperation:
+        fail(f"{kind} is not a decimal percentage")
+    if not parsed.is_finite() or parsed <= 0 or parsed > decimal_module.Decimal("75.00"):
+        fail(f"{kind} must be greater than zero and no greater than 75.00")
+    if parsed.as_tuple().exponent < -2:
+        fail(f"{kind} has more than two decimal places")
+    return f"{parsed:.2f}"
+
+
+def checked_uuid(kind: str, value: str) -> str:
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        fail(f"invalid {kind}: {value}")
+    canonical = str(parsed)
+    if value != canonical:
+        fail(f"{kind} must use canonical lowercase form: {canonical}")
+    return canonical
+
+
+def checked_lvm_uuid(kind: str, value: str) -> str:
+    if not LVM_UUID_RE.fullmatch(value):
+        fail(f"invalid {kind}: {value}")
+    return value
+
+
+@dataclass
+class InputFile:
+    kind: str
+    path: Path
+    fd: int
+    size: int
+    identity: tuple[int, int, int, int, int]
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+    def verify_stable(self) -> None:
+        metadata = os.fstat(self.fd)
+        identity = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+        if identity != self.identity:
+            fail(f"{self.kind} changed during the audit: {self.path}")
+
+
+def open_input(kind: str, path_arg: str, maximum: int | None = None) -> InputFile:
+    path = Path(path_arg).expanduser()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        fail(f"cannot open {kind} without following a final symlink: {path}: {error}")
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            fail(f"{kind} is not a regular file: {path}")
+        if maximum is not None and metadata.st_size > maximum:
+            fail(f"{kind} exceeds the {maximum}-byte limit: {metadata.st_size}")
+        identity = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+        return InputFile(kind, path, fd, metadata.st_size, identity)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_all(item: InputFile) -> bytes:
+    os.lseek(item.fd, 0, os.SEEK_SET)
+    result = bytearray()
+    while len(result) < item.size:
+        block = os.read(item.fd, min(1024 * 1024, item.size - len(result)))
+        if not block:
+            fail(f"unexpected EOF while reading {item.kind}")
+        result.extend(block)
+    if os.read(item.fd, 1):
+        fail(f"{item.kind} grew while being read")
+    return bytes(result)
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def required_dict(value: object, field: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        fail(f"{field} is not an object")
+    return value
+
+
+def required_string(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        fail(f"{field} is not a string")
+    return value
+
+
+def parse_json(data: bytes, kind: str) -> dict[str, object]:
+    try:
+        value = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"{kind} is not valid UTF-8 JSON: {error}")
+    return required_dict(value, kind)
+
+
+def parse_newc_manifest(data: bytes) -> tuple[dict[str, object], str]:
+    wanted = "usr/lib/frankensargo-duranium/build-manifest.json"
+    manifest_data: bytes | None = None
+    offset = 0
+    while True:
+        if offset + 110 > len(data) or data[offset : offset + 6] != b"070701":
+            fail(f"adapter is not a bounded newc archive at byte {offset}")
+        try:
+            fields = [
+                int(data[offset + 6 + index * 8 : offset + 14 + index * 8], 16)
+                for index in range(13)
+            ]
+        except ValueError:
+            fail(f"adapter has invalid newc metadata at byte {offset}")
+        offset += 110
+        size, namesize = fields[6], fields[11]
+        if namesize < 2 or offset + namesize > len(data):
+            fail("adapter has an invalid newc pathname length")
+        raw_name = data[offset : offset + namesize]
+        if not raw_name.endswith(b"\0"):
+            fail("adapter has a non-NUL-terminated newc pathname")
+        try:
+            name = raw_name[:-1].decode("utf-8")
+        except UnicodeDecodeError:
+            fail("adapter has a non-UTF-8 newc pathname")
+        offset += namesize
+        offset += -offset % 4
+        if offset + size > len(data):
+            fail(f"adapter newc payload for {name!r} lies outside the file")
+        contents = data[offset : offset + size]
+        offset += size
+        offset += -offset % 4
+        if name == "TRAILER!!!":
+            if size != 0:
+                fail("adapter newc trailer is nonempty")
+            break
+        if name == wanted:
+            if manifest_data is not None:
+                fail("adapter contains duplicate build manifests")
+            manifest_data = contents
+    if any(data[offset:]):
+        fail("adapter has nonzero bytes after its newc trailer")
+    if manifest_data is None:
+        fail("adapter lacks its build manifest")
+    return parse_json(manifest_data, "adapter build manifest"), sha256(manifest_data)
+
+
+def decimal(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        fail(f"{field} is not a decimal integer")
+    text = str(value)
+    if not text or not text.isascii() or not text.isdecimal():
+        fail(f"{field} is not a decimal integer")
+    return int(text)
+
+
+def validate_contract(
+    provenance: dict[str, object],
+    adapter_manifest: dict[str, object],
+    adapter_manifest_sha: str,
+    disk: InputFile,
+    adapter: InputFile,
+    adapter_sha: str,
+    args: argparse.Namespace,
+) -> str:
+    if provenance.get("format") != PROVENANCE_FORMAT:
+        fail("derived-disk provenance has the wrong format")
+    output = required_dict(provenance.get("output"), "provenance.output")
+    if required_string(output.get("basename"), "provenance.output.basename") != disk.path.name:
+        fail("derived-disk basename does not match provenance")
+    if decimal(output.get("bytes"), "provenance.output.bytes") != disk.size:
+        fail("derived-disk size does not match provenance")
+    expected_disk_sha = required_string(
+        output.get("sha256"), "provenance.output.sha256"
+    )
+    if not SHA256_RE.fullmatch(expected_disk_sha):
+        fail("provenance output SHA-256 is not canonical")
+
+    inputs = required_dict(provenance.get("inputs"), "provenance.inputs")
+    recorded_adapter = required_dict(inputs.get("adapter"), "provenance.inputs.adapter")
+    if required_string(recorded_adapter.get("basename"), "adapter basename") != adapter.path.name:
+        fail("adapter basename does not match provenance")
+    if decimal(recorded_adapter.get("bytes"), "adapter bytes") != adapter.size:
+        fail("adapter size does not match provenance")
+    if required_string(recorded_adapter.get("sha256"), "adapter SHA-256") != adapter_sha:
+        fail("adapter SHA-256 does not match provenance")
+    if recorded_adapter.get("format") != ADAPTER_FORMAT:
+        fail("provenance records the wrong adapter format")
+    if recorded_adapter.get("build_manifest_sha256") != adapter_manifest_sha:
+        fail("adapter build-manifest SHA-256 does not match provenance")
+
+    if adapter_manifest.get("format") != ADAPTER_FORMAT:
+        fail("adapter build manifest has the wrong format")
+    expected_scalars = {
+        "userdata_partuuid": args.userdata_partuuid,
+        "pv_uuid": args.pv_uuid,
+        "vg_uuid": args.vg_uuid,
+    }
+    for field, expected in expected_scalars.items():
+        if adapter_manifest.get(field) != expected:
+            fail(f"adapter {field} does not match the observed bootstrap identity")
+    disk_lv = required_dict(adapter_manifest.get("disk_lv"), "adapter disk_lv")
+    expected_disk_lv = {
+        "name": "disk-duranium",
+        "required_tag": "pocketboot.disk.v1",
+        "uuid": args.disk_lv_uuid,
+    }
+    if disk_lv != expected_disk_lv:
+        fail("adapter disk-LV binding is not exact")
+    cmdline = adapter_manifest.get("required_cmdline")
+    if cmdline != REQUIRED_CMDLINE:
+        fail("adapter required_cmdline is not the canonical exact list")
+
+    requirements = required_dict(provenance.get("requirements"), "provenance.requirements")
+    if requirements.get("duranium_cmdline") != REQUIRED_CMDLINE[:3]:
+        fail("derived-disk provenance has the wrong Duranium cmdline requirements")
+    return expected_disk_sha
+
+
+def hash_disk_and_padding(
+    disk: InputFile, chunk_bytes: int, virtual_bytes: int, max_write_bytes: int
+) -> tuple[str, str, int, int, list[dict[str, object]]]:
+    raw_hash = hashlib.sha256()
+    padded_hash = hashlib.sha256()
+    nonzero_chunks = 0
+    chunks = 0
+    maximum_extent_chunks = max_write_bytes // chunk_bytes
+    extents: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+
+    def finish_extent() -> None:
+        nonlocal current
+        if current is None:
+            return
+        hasher = current.pop("_hasher")
+        current["sha256"] = hasher.hexdigest()  # type: ignore[attr-defined]
+        extents.append(current)
+        current = None
+
+    os.lseek(disk.fd, 0, os.SEEK_SET)
+    remaining = disk.size
+    while remaining:
+        block = os.read(disk.fd, min(chunk_bytes, remaining))
+        if not block:
+            fail("derived disk ended while hashing")
+        raw_hash.update(block)
+        padded_hash.update(block)
+        if any(block):
+            nonzero_chunks += 1
+            if current is None or int(current["chunk_count"]) >= maximum_extent_chunks:
+                finish_extent()
+                current = {
+                    "start_chunk": chunks,
+                    "chunk_count": 0,
+                    "source_offset_bytes": chunks * chunk_bytes,
+                    "source_bytes": 0,
+                    "destination_offset_bytes": chunks * chunk_bytes,
+                    "_hasher": hashlib.sha256(),
+                }
+            assert current is not None
+            current["chunk_count"] = int(current["chunk_count"]) + 1
+            current["source_bytes"] = int(current["source_bytes"]) + len(block)
+            hasher = current["_hasher"]
+            hasher.update(block)  # type: ignore[attr-defined]
+        else:
+            finish_extent()
+        chunks += 1
+        remaining -= len(block)
+    finish_extent()
+    if os.read(disk.fd, 1):
+        fail("derived disk grew while hashing")
+
+    zero = bytes(chunk_bytes)
+    padding = virtual_bytes - disk.size
+    remaining = padding
+    while remaining:
+        amount = min(chunk_bytes, remaining)
+        padded_hash.update(zero if amount == chunk_bytes else zero[:amount])
+        remaining -= amount
+    return raw_hash.hexdigest(), padded_hash.hexdigest(), chunks, nonzero_chunks, extents
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description=(
+            "Verify a derived Duranium disk and exact adapter identities, then "
+            "calculate its sparse thin-allocation ceiling and full-LV readback hash."
+        )
+    )
+    result.add_argument("--disk", required=True)
+    result.add_argument("--provenance", required=True)
+    result.add_argument("--adapter", required=True)
+    result.add_argument("--userdata-partuuid", required=True)
+    result.add_argument("--pv-uuid", required=True)
+    result.add_argument("--vg-uuid", required=True)
+    result.add_argument("--disk-lv-uuid", required=True)
+    result.add_argument("--virtual-bytes", type=int, default=DEFAULT_VIRTUAL_BYTES)
+    result.add_argument("--pool-bytes", type=int, default=DEFAULT_POOL_BYTES)
+    result.add_argument("--chunk-bytes", type=int, default=DEFAULT_CHUNK_BYTES)
+    result.add_argument(
+        "--max-write-bytes", type=int, default=DEFAULT_MAX_WRITE_BYTES
+    )
+    result.add_argument(
+        "--minimum-pool-free-bytes",
+        type=int,
+        default=DEFAULT_MINIMUM_POOL_FREE_BYTES,
+    )
+    result.add_argument(
+        "--maximum-pool-metadata-percent",
+        default=DEFAULT_MAXIMUM_POOL_METADATA_PERCENT,
+        help=(
+            "maximum conservative live thin-pool Metadata%% accepted by the "
+            "import controller (must be <= 75.00)"
+        ),
+    )
+    return result
+
+
+def audit(args: argparse.Namespace) -> dict[str, object]:
+    args.userdata_partuuid = checked_uuid("userdata PARTUUID", args.userdata_partuuid)
+    args.pv_uuid = checked_lvm_uuid("PV UUID", args.pv_uuid)
+    args.vg_uuid = checked_lvm_uuid("VG UUID", args.vg_uuid)
+    args.disk_lv_uuid = checked_lvm_uuid("disk LV UUID", args.disk_lv_uuid)
+    virtual_bytes = checked_positive("virtual bytes", args.virtual_bytes)
+    pool_bytes = checked_positive("pool bytes", args.pool_bytes)
+    chunk_bytes = checked_positive("chunk bytes", args.chunk_bytes)
+    max_write_bytes = checked_positive("maximum write bytes", args.max_write_bytes)
+    minimum_free = checked_positive(
+        "minimum pool free bytes", args.minimum_pool_free_bytes
+    )
+    maximum_metadata_percent = checked_metadata_percent(
+        "maximum pool metadata percent", args.maximum_pool_metadata_percent
+    )
+    if chunk_bytes < 512 or chunk_bytes % 512 or chunk_bytes & (chunk_bytes - 1):
+        fail("chunk bytes must be a power-of-two multiple of 512")
+    if virtual_bytes % 512 or pool_bytes % chunk_bytes:
+        fail("virtual bytes must be sector-aligned and pool bytes must be chunk-aligned")
+    if max_write_bytes % chunk_bytes:
+        fail("maximum write bytes must be a multiple of chunk bytes")
+    if minimum_free >= pool_bytes:
+        fail("minimum pool free bytes must be smaller than the pool")
+
+    disk = open_input("derived disk", args.disk)
+    provenance_file = open_input("provenance", args.provenance, MAX_METADATA_BYTES)
+    adapter = open_input("adapter", args.adapter, 256 * 1024 * 1024)
+    inputs = (disk, provenance_file, adapter)
+    try:
+        if len({item.identity[:2] for item in inputs}) != len(inputs):
+            fail("disk, provenance, and adapter must be distinct regular files")
+        if disk.size > virtual_bytes:
+            fail("derived disk is larger than the destination thin LV")
+        provenance = parse_json(read_all(provenance_file), "derived-disk provenance")
+        adapter_data = read_all(adapter)
+        adapter_sha = sha256(adapter_data)
+        adapter_manifest, manifest_sha = parse_newc_manifest(adapter_data)
+        expected_disk_sha = validate_contract(
+            provenance,
+            adapter_manifest,
+            manifest_sha,
+            disk,
+            adapter,
+            adapter_sha,
+            args,
+        )
+        raw_sha, padded_sha, chunks, nonzero_chunks, write_extents = hash_disk_and_padding(
+            disk, chunk_bytes, virtual_bytes, max_write_bytes
+        )
+        if raw_sha != expected_disk_sha:
+            fail(f"derived-disk SHA-256 mismatch: expected {expected_disk_sha}, got {raw_sha}")
+        mapped_upper = nonzero_chunks * chunk_bytes
+        maximum_new_mapped = pool_bytes - minimum_free
+        if mapped_upper > maximum_new_mapped:
+            fail(
+                "sparse import could exceed the pool-data budget: "
+                f"{mapped_upper} > {maximum_new_mapped} bytes"
+            )
+        for item in inputs:
+            item.verify_stable()
+        return {
+            "schema": FORMAT,
+            "binding": {
+                "userdata_partuuid": args.userdata_partuuid,
+                "pv_uuid": args.pv_uuid,
+                "vg_uuid": args.vg_uuid,
+                "disk_lv_name": "disk-duranium",
+                "disk_lv_uuid": args.disk_lv_uuid,
+                "required_import_tag": "greygoo.import-pending",
+                "published_tag": "pocketboot.disk.v1",
+            },
+            "inputs": {
+                "disk": {
+                    "basename": disk.path.name,
+                    "bytes": disk.size,
+                    "sha256": raw_sha,
+                },
+                "provenance": {
+                    "basename": provenance_file.path.name,
+                    "sha256": sha256(read_all(provenance_file)),
+                },
+                "adapter": {
+                    "basename": adapter.path.name,
+                    "bytes": adapter.size,
+                    "sha256": adapter_sha,
+                    "build_manifest_sha256": manifest_sha,
+                },
+            },
+            "destination": {
+                "virtual_bytes": virtual_bytes,
+                "zero_tail_bytes": virtual_bytes - disk.size,
+                "full_lv_sha256": padded_sha,
+            },
+            "thin_pool_gate": {
+                "pool_bytes": pool_bytes,
+                "chunk_bytes": chunk_bytes,
+                "source_chunks": chunks,
+                "source_nonzero_chunks": nonzero_chunks,
+                "sparse_write_extent_count": len(write_extents),
+                "new_mapped_bytes_upper_bound": mapped_upper,
+                "minimum_pool_free_bytes_after_empty_pool_import": pool_bytes
+                - mapped_upper,
+                "required_minimum_pool_free_bytes": minimum_free,
+                "maximum_pool_metadata_percent": maximum_metadata_percent,
+                "requires_live_pre_and_post_pool_usage_check": True,
+                "requires_live_before_every_remaining_extent_check": True,
+                "requires_live_full_hash_and_publication_check": True,
+            },
+            "import_contract": {
+                "write_block_bytes": chunk_bytes,
+                "maximum_write_bytes": max_write_bytes,
+                "skip_all_zero_blocks": True,
+                "preserve_unwritten_zero_tail": True,
+                "write_extents": write_extents,
+                "readback_bytes": virtual_bytes,
+                "readback_sha256": padded_sha,
+            },
+        }
+    finally:
+        for item in inputs:
+            item.close()
+
+
+def main() -> int:
+    try:
+        result = audit(parser().parse_args())
+    except AuditError as error:
+        print(f"audit-duranium-import: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

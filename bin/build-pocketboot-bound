@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""Build one provenance-bound PocketBoot image for an observed outer VG."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import tomllib
+import uuid
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lib"))
+
+from pocketboot_profile import ProfileError, without_acm_cmdline  # noqa: E402
+
+
+SOURCES_LOCK = ROOT / "config" / "sources.lock"
+DEVICE_ID = "qcom/sdm670-google-sargo"
+CONFIG_RELATIVE = Path("configs/device/qcom/sdm670-google-sargo.toml")
+OUTPUT_NAME = "pocketboot-sargo-lvm-bound.img"
+JOURNAL_NAME = "frankensargo-bound-build.json"
+JOURNAL_FORMAT = "org.frankensargo.pocketboot-bound-build-journal/1"
+PROVENANCE_FORMAT = "org.frankensargo.pocketboot-bound-image/1"
+LVM_UUID_RE = re.compile(
+    r"[A-Za-z0-9]{6}(?:-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}\Z"
+)
+SOURCE_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+MAX_CONFIG_BYTES = 1024 * 1024
+MAX_JOURNAL_BYTES = 64 * 1024
+ANDROID_MAGIC = b"ANDROID!"
+ANDROID_CMDLINE_OFFSET = 64
+ANDROID_CMDLINE_BYTES = 512
+ANDROID_EXTRA_CMDLINE_OFFSET = 608
+ANDROID_EXTRA_CMDLINE_BYTES = 1024
+EXPECTED_HEADER_VERSION = 2
+
+
+class BuildError(RuntimeError):
+    pass
+
+
+def fail(message: str) -> "None":
+    raise BuildError(message)
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb", buffering=0) as stream:
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def checked_lvm_uuid(value: str) -> str:
+    if not LVM_UUID_RE.fullmatch(value):
+        fail(f"invalid VG UUID: {value}")
+    return value
+
+
+def checked_partuuid(value: str) -> str:
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        fail(f"invalid PV PARTUUID: {value}")
+    canonical = str(parsed)
+    if value != canonical:
+        fail(f"PV PARTUUID must use canonical lowercase form: {canonical}")
+    return canonical
+
+
+def load_sources(path: Path = SOURCES_LOCK) -> dict[str, str]:
+    result: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        fail(f"cannot read source lock {path}: {error}")
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            fail(f"source lock line {number} is not a simple assignment")
+        key, value = line.split("=", 1)
+        if not SOURCE_KEY_RE.fullmatch(key) or not value or any(
+            byte.isspace() for byte in value
+        ):
+            fail(f"source lock line {number} is not a canonical assignment")
+        if key in result:
+            fail(f"source lock repeats {key}")
+        result[key] = value
+    for key in (
+        "POCKETBOOT_URL",
+        "POCKETBOOT_REV",
+        "SDM670_KERNEL_URL",
+        "SDM670_KERNEL_REV",
+        "SDM670_KERNEL_LOCAL",
+    ):
+        if key not in result:
+            fail(f"source lock omits {key}")
+    return result
+
+
+def canonical_cmdline(value: str, field: str) -> str:
+    if not value or value != value.strip() or "  " in value:
+        fail(f"{field} has noncanonical whitespace")
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        fail(f"{field} is not ASCII")
+    if any(byte < 0x20 or byte > 0x7E for byte in encoded):
+        fail(f"{field} contains a non-printable byte")
+    if len(encoded) >= ANDROID_CMDLINE_BYTES + ANDROID_EXTRA_CMDLINE_BYTES:
+        fail(f"{field} does not fit the Android v2 cmdline fields")
+    return value
+
+
+def bound_cmdline(base: str, vg_uuid: str, partuuids: list[str]) -> str:
+    base = canonical_cmdline(base, "base PocketBoot cmdline")
+    tokens = base.split(" ")
+    if tokens.count("sysrq_always_enabled=1") != 1:
+        fail("base PocketBoot cmdline lacks exactly one sysrq_always_enabled=1")
+    for token in tokens:
+        if token.startswith("pocketboot.vg_uuid=") or token.startswith(
+            "pocketboot.pv_partuuid="
+        ):
+            fail("base PocketBoot cmdline already contains an LVM binding")
+    suffix = [f"pocketboot.vg_uuid={vg_uuid}"] + [
+        f"pocketboot.pv_partuuid={partuuid}" for partuuid in partuuids
+    ]
+    return canonical_cmdline(" ".join([*tokens, *suffix]), "bound PocketBoot cmdline")
+
+
+def render_bound_config(
+    original: bytes,
+    vg_uuid: str,
+    partuuids: list[str],
+    *,
+    no_acm: bool = False,
+) -> tuple[bytes, str, str, str]:
+    if len(original) > MAX_CONFIG_BYTES:
+        fail("sargo device configuration exceeds the size limit")
+    try:
+        parsed = tomllib.loads(original.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        fail(f"sargo device configuration is invalid TOML: {error}")
+    if "cmdline" in parsed:
+        fail("sargo device configuration has a forbidden top-level cmdline")
+    bootimg = parsed.get("bootimg")
+    if not isinstance(bootimg, dict) or not isinstance(bootimg.get("cmdline"), str):
+        fail("sargo device configuration lacks [bootimg].cmdline")
+    base = bootimg["cmdline"]
+    try:
+        profile_cmdline = without_acm_cmdline(base) if no_acm else base
+    except ProfileError as error:
+        fail(f"invalid no-ACM profile: {error}")
+    result_cmdline = bound_cmdline(profile_cmdline, vg_uuid, partuuids)
+    try:
+        text = original.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("sargo device configuration is not UTF-8")
+    original_line = f"cmdline = {json.dumps(base)}"
+    replacement_line = f"cmdline = {json.dumps(result_cmdline)}"
+    if text.splitlines().count(original_line) != 1:
+        fail("sargo device configuration cmdline is not one canonical TOML line")
+    rendered = text.replace(original_line, replacement_line, 1).encode()
+    try:
+        reparsed = tomllib.loads(rendered.decode())
+    except tomllib.TOMLDecodeError as error:
+        fail(f"internal bound configuration is invalid TOML: {error}")
+    reparsed_bootimg = reparsed.get("bootimg")
+    if not isinstance(reparsed_bootimg, dict) or reparsed_bootimg.get("cmdline") != result_cmdline:
+        fail("internal bound configuration lost the exact cmdline")
+    return rendered, base, profile_cmdline, result_cmdline
+
+
+def android_boot_cmdline(data: bytes) -> str:
+    minimum = ANDROID_EXTRA_CMDLINE_OFFSET + ANDROID_EXTRA_CMDLINE_BYTES
+    if len(data) < minimum or data[:8] != ANDROID_MAGIC:
+        fail("built artifact is not a bounded Android boot image")
+    header_version = int.from_bytes(data[40:44], "little")
+    if header_version != EXPECTED_HEADER_VERSION:
+        fail(
+            f"built Android boot image header version is {header_version}, "
+            f"expected {EXPECTED_HEADER_VERSION}"
+        )
+    raw = (
+        data[
+            ANDROID_CMDLINE_OFFSET : ANDROID_CMDLINE_OFFSET
+            + ANDROID_CMDLINE_BYTES
+        ]
+        + data[
+            ANDROID_EXTRA_CMDLINE_OFFSET : ANDROID_EXTRA_CMDLINE_OFFSET
+            + ANDROID_EXTRA_CMDLINE_BYTES
+        ]
+    )
+    text, separator, padding = raw.partition(b"\0")
+    if not separator or any(padding):
+        fail("built Android boot image cmdline has noncanonical padding")
+    try:
+        decoded = text.decode("ascii")
+    except UnicodeDecodeError:
+        fail("built Android boot image cmdline is not ASCII")
+    return canonical_cmdline(decoded, "built Android boot image cmdline")
+
+
+def run(
+    command: list[str], *, cwd: Path | None = None, capture: bool = True
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        result = subprocess.run(
+            command, cwd=cwd, capture_output=capture, check=False
+        )
+    except OSError as error:
+        fail(f"cannot execute {command[0]}: {error}")
+    if result.returncode != 0:
+        detail = (
+            (result.stderr or result.stdout or b"").decode("utf-8", "replace").strip()
+            if capture
+            else "see command output above"
+        )
+        fail(f"command failed ({result.returncode}): {' '.join(command)}: {detail}")
+    return result
+
+
+def git_output(source: Path, *arguments: str, environment: dict[str, str] | None = None) -> str:
+    command = ["git", "-C", str(source), *arguments]
+    try:
+        result = subprocess.run(
+            command, env=environment, text=True, capture_output=True, check=False
+        )
+    except OSError as error:
+        fail(f"cannot execute git: {error}")
+    if result.returncode != 0:
+        fail(f"git {' '.join(arguments)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def worktree_tree(source: Path, revision: str) -> str:
+    descriptor, index_name = tempfile.mkstemp(prefix="frankensargo-bound-index-")
+    os.close(descriptor)
+    os.unlink(index_name)
+    environment = os.environ.copy()
+    environment["GIT_INDEX_FILE"] = index_name
+    try:
+        git_output(source, "read-tree", revision, environment=environment)
+        git_output(source, "add", "-A", "--", ".", environment=environment)
+        return git_output(source, "write-tree", environment=environment)
+    finally:
+        try:
+            os.unlink(index_name)
+        except FileNotFoundError:
+            pass
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def acquire_source_lock(source: Path) -> int:
+    path = Path(f"{source}.frankensargo-build.lock")
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        fail(f"another PocketBoot build holds the source lock: {path}")
+    return descriptor
+
+
+def atomic_replace(path: Path, data: bytes, mode: int) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        descriptor = -1
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def write_exclusive(path: Path, data: bytes, mode: int = 0o644) -> None:
+    descriptor = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode
+    )
+    complete = False
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                fail(f"short write while publishing {path}")
+            view = view[written:]
+        os.fsync(descriptor)
+        complete = True
+    finally:
+        os.close(descriptor)
+        if not complete:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+    fsync_directory(path.parent)
+
+
+def load_journal(path: Path) -> dict[str, object]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        fail(f"cannot open interrupted-build journal: {error}")
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_JOURNAL_BYTES:
+            fail("interrupted-build journal is not a bounded regular file")
+        data = os.read(descriptor, metadata.st_size + 1)
+        if len(data) != metadata.st_size:
+            fail("interrupted-build journal changed while reading")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"interrupted-build journal is invalid JSON: {error}")
+    if not isinstance(value, dict) or value.get("format") != JOURNAL_FORMAT:
+        fail("interrupted-build journal has the wrong format")
+    return value
+
+
+def remove_journal(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    fsync_directory(path.parent)
+
+
+def recover_interrupted_edit(config: Path, journal_path: Path) -> None:
+    journal = load_journal(journal_path)
+    if not journal:
+        return
+    if journal.get("config_relative") != str(CONFIG_RELATIVE):
+        fail("interrupted-build journal names an unexpected configuration")
+    try:
+        original = base64.b64decode(str(journal["original_base64"]), validate=True)
+        original_sha = str(journal["original_sha256"])
+        bound_sha = str(journal["bound_sha256"])
+    except (KeyError, ValueError) as error:
+        fail(f"interrupted-build journal is incomplete: {error}")
+    if sha256_bytes(original) != original_sha:
+        fail("interrupted-build journal original hash is invalid")
+    try:
+        current = config.read_bytes()
+        mode = stat.S_IMODE(config.stat().st_mode)
+    except OSError as error:
+        fail(f"cannot inspect interrupted bound configuration: {error}")
+    current_sha = sha256_bytes(current)
+    if current_sha == original_sha:
+        remove_journal(journal_path)
+        return
+    if current_sha != bound_sha:
+        fail("configuration differs from both sides of interrupted bound edit")
+    atomic_replace(config, original, mode)
+    remove_journal(journal_path)
+
+
+def write_journal(
+    path: Path, original: bytes, bound: bytes, base_tree: str, bound_cmdline_value: str
+) -> None:
+    value = {
+        "format": JOURNAL_FORMAT,
+        "config_relative": str(CONFIG_RELATIVE),
+        "original_base64": base64.b64encode(original).decode("ascii"),
+        "original_sha256": sha256_bytes(original),
+        "bound_sha256": sha256_bytes(bound),
+        "base_tree": base_tree,
+        "bound_cmdline": bound_cmdline_value,
+    }
+    write_exclusive(path, (json.dumps(value, sort_keys=True) + "\n").encode(), 0o600)
+
+
+def provenance(
+    *,
+    sources: dict[str, str],
+    image_sha: str,
+    image_bytes: int,
+    base_tree: str,
+    bound_tree: str,
+    base_cmdline: str,
+    profile_cmdline: str,
+    bound_cmdline_value: str,
+    no_acm: bool,
+    output_name: str,
+    vg_uuid: str,
+    partuuids: list[str],
+    patches: list[dict[str, str]],
+) -> bytes:
+    value: dict[str, object] = {
+        "format": PROVENANCE_FORMAT,
+        "profile": (
+            "interim-lvm-bound-lab-no-acm" if no_acm else "interim-lvm-bound-lab"
+        ),
+        "binding": {
+            "vg_uuid": vg_uuid,
+            "pv_partuuids": partuuids,
+            "kernel_cmdline": bound_cmdline_value,
+        },
+        "pocketboot": {
+            "url": sources["POCKETBOOT_URL"],
+            "revision": sources["POCKETBOOT_REV"],
+            "base_patched_tree": base_tree,
+            "bound_tree": bound_tree,
+            "base_cmdline": base_cmdline,
+            "profile_cmdline": profile_cmdline,
+            "profile_source_delta": (
+                "remove-cmdline-token:pocketboot.acm" if no_acm else "none"
+            ),
+        },
+        "kernel": {
+            "url": sources["SDM670_KERNEL_URL"],
+            "revision": sources["SDM670_KERNEL_REV"],
+        },
+        "patches": patches,
+        "output": {
+            "basename": output_name,
+            "bytes": image_bytes,
+            "sha256": image_sha,
+        },
+        "built_at_utc": datetime.datetime.now(datetime.UTC)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z"),
+    }
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+
+
+def patch_records() -> list[dict[str, str]]:
+    records = [
+        {"name": path.name, "sha256": sha256_file(path)}
+        for path in sorted((ROOT / "patches" / "pocketboot").glob("*.patch"))
+    ]
+    if not records:
+        fail("PocketBoot patch directory is empty")
+    return records
+
+
+def parser(sources: dict[str, str]) -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description=(
+            "Build a sargo PocketBoot image whose Android kernel command line "
+            "is bound to one observed VG UUID and explicit PV PARTUUID allowlist."
+        )
+    )
+    result.add_argument("--vg-uuid", required=True)
+    result.add_argument("--pv-partuuid", required=True, action="append")
+    result.add_argument("--kernel-tree", default=sources["SDM670_KERNEL_LOCAL"])
+    result.add_argument("--source-dir", default=str(ROOT / ".work" / "pocketboot"))
+    result.add_argument("--output-dir")
+    result.add_argument("--cargo", default="cargo")
+    result.add_argument("--prepare-only", action="store_true")
+    result.add_argument(
+        "--no-acm",
+        action="store_true",
+        help="remove exactly one pocketboot.acm token before adding the LVM binding",
+    )
+    return result
+
+
+def install_signal_handlers() -> None:
+    def interrupted(signum: int, _frame: object) -> "None":
+        raise InterruptedError(f"received signal {signum}")
+
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
+
+
+def build(args: argparse.Namespace, sources: dict[str, str]) -> dict[str, object]:
+    vg_uuid = checked_lvm_uuid(args.vg_uuid)
+    partuuids = [checked_partuuid(value) for value in args.pv_partuuid]
+    if len(set(partuuids)) != len(partuuids):
+        fail("PV PARTUUID allowlist contains a duplicate")
+    kernel_tree = Path(args.kernel_tree).expanduser().resolve()
+    source = Path(args.source_dir).expanduser().resolve()
+    output_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else ROOT / "out" / "pocketboot-bound" / vg_uuid.replace("-", "")
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_name = (
+        "pocketboot-sargo-lvm-bound-noacm.img" if args.no_acm else OUTPUT_NAME
+    )
+
+    base_builder = ROOT / "bin" / "build-pocketboot"
+    prepare_command = [
+        str(base_builder),
+        "--kernel-tree",
+        str(kernel_tree),
+        "--source-dir",
+        str(source),
+        "--output-dir",
+        str(output_dir),
+        "--prepare-only",
+    ]
+    git_dir = source / ".git"
+    if git_dir.is_dir():
+        recovery_lock = acquire_source_lock(source)
+        try:
+            recover_interrupted_edit(source / CONFIG_RELATIVE, git_dir / JOURNAL_NAME)
+        finally:
+            os.close(recovery_lock)
+    run(prepare_command)
+    if not git_dir.is_dir():
+        fail(f"prepared PocketBoot source has no .git directory: {source}")
+    revision = sources["POCKETBOOT_REV"]
+    prepared_tree = worktree_tree(source, revision)
+    lock_descriptor = acquire_source_lock(source)
+    temp_artifact: Path | None = None
+    published: list[Path] = []
+    try:
+        config = source / CONFIG_RELATIVE
+        journal = git_dir / JOURNAL_NAME
+        recover_interrupted_edit(config, journal)
+        if worktree_tree(source, revision) != prepared_tree:
+            fail("PocketBoot source changed between preparation and source lock")
+        patches = patch_records()
+
+        original = config.read_bytes()
+        mode = stat.S_IMODE(config.stat().st_mode)
+        bound, base_cmdline, profile_cmdline, bound_value = render_bound_config(
+            original, vg_uuid, partuuids, no_acm=args.no_acm
+        )
+        base_tree = worktree_tree(source, revision)
+        write_journal(journal, original, bound, base_tree, bound_value)
+
+        bound_tree = ""
+        try:
+            atomic_replace(config, bound, mode)
+            bound_tree = worktree_tree(source, revision)
+            if bound_tree == base_tree:
+                fail("bound PocketBoot source tree did not change")
+            if args.prepare_only:
+                return {
+                    "prepared": str(source),
+                    "base_tree": base_tree,
+                    "bound_tree": bound_tree,
+                    "profile": "lab-no-acm" if args.no_acm else "lab",
+                    "base_cmdline": base_cmdline,
+                    "profile_cmdline": profile_cmdline,
+                    "bound_cmdline": bound_value,
+                    "vg_uuid": vg_uuid,
+                    "pv_partuuids": partuuids,
+                }
+
+            final_image = output_dir / output_name
+            final_sha = output_dir / f"{output_name}.sha256"
+            final_provenance = output_dir / f"{output_name}.provenance.json"
+            for path in (final_image, final_sha, final_provenance):
+                if os.path.lexists(path):
+                    fail(f"output exists; refusing to replace it: {path}")
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{output_name}.", suffix=".tmp", dir=output_dir
+            )
+            os.close(descriptor)
+            os.unlink(temporary)
+            temp_artifact = Path(temporary)
+            run(
+                [
+                    args.cargo,
+                    "xtask",
+                    "build",
+                    DEVICE_ID,
+                    str(kernel_tree),
+                    "--output",
+                    str(temp_artifact),
+                ],
+                cwd=source,
+                capture=False,
+            )
+            metadata = temp_artifact.stat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size == 0:
+                fail("bound build produced no regular image")
+            with temp_artifact.open("rb", buffering=0) as stream:
+                header = stream.read(
+                    ANDROID_EXTRA_CMDLINE_OFFSET + ANDROID_EXTRA_CMDLINE_BYTES
+                )
+                os.fsync(stream.fileno())
+            observed_cmdline = android_boot_cmdline(header)
+            if observed_cmdline != bound_value:
+                fail("finished Android boot image cmdline does not match the binding")
+            image_sha = sha256_file(temp_artifact)
+            image_bytes = metadata.st_size
+        finally:
+            current = config.read_bytes()
+            if sha256_bytes(current) not in (sha256_bytes(original), sha256_bytes(bound)):
+                fail("PocketBoot configuration changed unexpectedly during bound build")
+            if current != original:
+                atomic_replace(config, original, mode)
+            remove_journal(journal)
+            if worktree_tree(source, revision) != base_tree:
+                fail("PocketBoot source tree did not return to its exact base state")
+
+        provenance_data = provenance(
+            sources=sources,
+            image_sha=image_sha,
+            image_bytes=image_bytes,
+            base_tree=base_tree,
+            bound_tree=bound_tree,
+            base_cmdline=base_cmdline,
+            profile_cmdline=profile_cmdline,
+            bound_cmdline_value=bound_value,
+            no_acm=args.no_acm,
+            output_name=output_name,
+            vg_uuid=vg_uuid,
+            partuuids=partuuids,
+            patches=patches,
+        )
+        if patch_records() != patches:
+            fail("PocketBoot patch stack changed during the bound build")
+        assert temp_artifact is not None
+        os.link(temp_artifact, final_image, follow_symlinks=False)
+        published.append(final_image)
+        write_exclusive(
+            final_sha, f"{image_sha}  {output_name}\n".encode(), 0o644
+        )
+        published.append(final_sha)
+        write_exclusive(final_provenance, provenance_data, 0o644)
+        published.append(final_provenance)
+        temp_artifact.unlink()
+        temp_artifact = None
+        fsync_directory(output_dir)
+        return {
+            "image": str(final_image),
+            "sha256": image_sha,
+            "provenance": str(final_provenance),
+            "bound_tree": bound_tree,
+            "profile": "lab-no-acm" if args.no_acm else "lab",
+            "base_cmdline": base_cmdline,
+            "profile_cmdline": profile_cmdline,
+            "bound_cmdline": bound_value,
+        }
+    except BaseException:
+        for path in reversed(published):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        if temp_artifact is not None:
+            try:
+                temp_artifact.unlink()
+            except FileNotFoundError:
+                pass
+        os.close(lock_descriptor)
+
+
+def main() -> int:
+    try:
+        sources = load_sources()
+        args = parser(sources).parse_args()
+        install_signal_handlers()
+        result = build(args, sources)
+    except (BuildError, InterruptedError, KeyboardInterrupt, OSError) as error:
+        print(f"build-pocketboot-bound: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

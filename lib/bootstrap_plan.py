@@ -39,6 +39,7 @@ LVM_CONF_SHA256 = (
 VG_NAME = "franken"
 EXPECTED_PARTLABEL = "userdata"
 EXPECTED_PARTTYPE = "1b81e7e6-f50d-419b-a739-2aeef8da3335"
+EXPECTED_KERNEL_NAME = "mmcblk0p72"
 EXPECTED_SECTOR_BYTES = 512
 EXPECTED_RAW_BYTES = 53_648_801_280
 PE_BYTES = 4 * 1024 * 1024
@@ -771,6 +772,8 @@ def build_plan(
         raise PlanError("bootstrap target is not the userdata partition")
     if evidence.parttype != EXPECTED_PARTTYPE:
         raise PlanError("userdata GPT type does not match the inventoried Android userdata type")
+    if evidence.kernel_name != EXPECTED_KERNEL_NAME:
+        raise PlanError("userdata is not the fixed mmcblk0p72 bootstrap target")
     if evidence.sector_bytes != EXPECTED_SECTOR_BYTES:
         raise PlanError("userdata logical sector size is not 512 bytes")
     if evidence.raw_bytes != evidence.sectors * evidence.sector_bytes:

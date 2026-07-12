@@ -1,0 +1,70 @@
+diff --git a/xtask/src/commands/busybox.rs b/xtask/src/commands/busybox.rs
+index d014970..d3ec630 100644
+--- a/xtask/src/commands/busybox.rs
++++ b/xtask/src/commands/busybox.rs
+@@ -20,7 +20,7 @@ use super::{
+ };
+ 
+ pub(super) const BUSYBOX_VERSION: &str = "1.38.0";
+-const BUSYBOX_RECIPE_VERSION: u32 = 4;
++const BUSYBOX_RECIPE_VERSION: u32 = 5;
+ const BUSYBOX_ARCHIVE_SHA256: &str =
+     "34f9ea6ff8636f2c9241153b9114eefa9e65674a45318ae1ef95bb5f31c53bb2";
+ const BUSYBOX_SOURCE_URL: &str = "https://busybox.net/downloads/busybox-1.38.0.tar.bz2";
+@@ -508,6 +508,7 @@ fn configure_busybox(config: &Path, features: &FeatureSet) -> Result<()> {
+         "RMDIR",
+         "SED",
+         "SETSID",
++        "SHA256SUM",
+         "SLEEP",
+         "SORT",
+         "STAT",
+@@ -853,3 +854,48 @@ fn strip_busybox(binary: &Path, target: &str) -> Result<()> {
+     command.arg("--strip-all").arg(binary);
+     run_command(command, "strip busybox")
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::{SystemTime, UNIX_EPOCH};
++
++    #[test]
++    fn default_recipe_enables_sha256sum_and_invalidates_old_cache() {
++        let temp = TempDir::new();
++        let config = temp.path.join(".config");
++        fs::write(&config, "# CONFIG_SHA256SUM is not set\n").unwrap();
++
++        configure_busybox(&config, &FeatureSet::default()).unwrap();
++
++        let configured = fs::read_to_string(config).unwrap();
++        assert_eq!(BUSYBOX_RECIPE_VERSION, 5);
++        assert_eq!(configured.matches("CONFIG_SHA256SUM=y").count(), 1);
++        assert!(!configured.contains("# CONFIG_SHA256SUM is not set"));
++    }
++
++    struct TempDir {
++        path: PathBuf,
++    }
++
++    impl TempDir {
++        fn new() -> Self {
++            let nonce = SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .unwrap()
++                .as_nanos();
++            let path = std::env::temp_dir().join(format!(
++                "pocketboot-busybox-test-{}-{nonce}",
++                std::process::id()
++            ));
++            fs::create_dir(&path).unwrap();
++            Self { path }
++        }
++    }
++
++    impl Drop for TempDir {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.path);
++        }
++    }
++}
