@@ -1,18 +1,22 @@
 diff --git a/src/fastboot/mod.rs b/src/fastboot/mod.rs
-index 0d51f680321b3497e739c72c2736097521604e2b..69994fb5d2c5490a39c3a4b6b9e3b2d513a8fa58 100644
+index 0d51f680321b3497e739c72c2736097521604e2b..27b2ef17d88987ab57eabfface2466706f2a140e 100644
 --- a/src/fastboot/mod.rs
 +++ b/src/fastboot/mod.rs
-@@ -26,6 +26,9 @@ const COMMAND_MAX: usize = 64;
+@@ -26,6 +26,13 @@ const COMMAND_MAX: usize = 64;
  const DOWNLOAD_PREFIX: &str = "download:";
  pub(crate) const MAX_DOWNLOAD_SIZE: u32 = 256 * 1024 * 1024;
  const TRANSFER_CHUNK: usize = 1024 * 1024;
-+// gadgetry-most-foul splits writes into 16 KiB AIO requests. Sargo's DWC3
++// gadgetry-most-foul splits writes into FunctionFS AIO requests. Sargo's DWC3
 +// rejects concurrent IN requests, so keep exactly one upload request in flight.
 +const FASTBOOT_TX_QUEUE_LEN: u32 = 1;
++// Real userdata uploads have also left larger AIO writes incomplete even at
++// queue depth one. The same link is stable with ADB's 4 KiB writes, so bound
++// every fastboot payload write to that proven size.
++const FASTBOOT_TX_WRITE_SIZE: usize = 4 * 1024;
  const RESPONSE_MAX: usize = 64;
  const RESPONSE_STATUS_LEN: usize = 4;
  const RESPONSE_PAYLOAD_MAX: usize = RESPONSE_MAX - RESPONSE_STATUS_LEN;
-@@ -133,7 +136,7 @@ pub(crate) struct UsbFunction {
+@@ -133,7 +140,7 @@ pub(crate) struct UsbFunction {
  impl UsbFunction {
      pub(crate) fn new(commands: CommandMap) -> Self {
          let (rx, rx_dir) = EndpointDirection::host_to_device();
@@ -21,7 +25,19 @@ index 0d51f680321b3497e739c72c2736097521604e2b..69994fb5d2c5490a39c3a4b6b9e3b2d5
          let (custom, handle) = Custom::builder()
              .with_interface(
                  Interface::new(
-@@ -645,6 +648,11 @@ fn transfer_buffer(len: usize) -> io::Result<Vec<u8>> {
+@@ -553,7 +560,10 @@ impl<'a> FastbootResponder<'a> {
+     }
+ 
+     fn send_payload(&mut self, data: &[u8]) -> io::Result<()> {
+-        self.tx.write_all_timeout(data, TRANSFER_TIMEOUT)
++        for chunk in fastboot_tx_chunks(data) {
++            self.tx.write_all_timeout(chunk, TRANSFER_TIMEOUT)?;
++        }
++        Ok(())
+     }
+ 
+     fn send_payload_from_reader(
+@@ -645,6 +655,15 @@ fn transfer_buffer(len: usize) -> io::Result<Vec<u8>> {
      Ok(buffer)
  }
  
@@ -30,10 +46,14 @@ index 0d51f680321b3497e739c72c2736097521604e2b..69994fb5d2c5490a39c3a4b6b9e3b2d5
 +    (endpoint, direction.with_queue_len(FASTBOOT_TX_QUEUE_LEN))
 +}
 +
++fn fastboot_tx_chunks(data: &[u8]) -> impl Iterator<Item = &[u8]> {
++    data.chunks(FASTBOOT_TX_WRITE_SIZE)
++}
++
  fn find_command_handler<'a>(
      commands: &'a [Command],
      command: &str,
-@@ -836,4 +844,11 @@ mod tests {
+@@ -836,4 +855,23 @@ mod tests {
              );
          }
      }
@@ -43,5 +63,17 @@ index 0d51f680321b3497e739c72c2736097521604e2b..69994fb5d2c5490a39c3a4b6b9e3b2d5
 +        let (_endpoint, direction) = fastboot_device_to_host();
 +
 +        assert_eq!(direction.queue_len, 1);
++    }
++
++    #[test]
++    fn bounds_device_to_host_payload_writes_to_four_kib() {
++        let payload = vec![0xa5; FASTBOOT_TX_WRITE_SIZE * 2 + 17];
++        let chunks = fastboot_tx_chunks(&payload).collect::<Vec<_>>();
++
++        assert_eq!(
++            chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
++            [FASTBOOT_TX_WRITE_SIZE, FASTBOOT_TX_WRITE_SIZE, 17]
++        );
++        assert_eq!(chunks.concat(), payload);
 +    }
  }

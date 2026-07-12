@@ -232,13 +232,31 @@ attempt is backup evidence.
 `gadgetry-most-foul` defaults the endpoint direction to a queue depth of 16
 and splits a logical write into 16 KiB AIO requests. PocketBoot's fastboot
 transfer buffer remains 1 MiB, so one upload write can present many requests
-to the endpoint concurrently. The focused
+to the endpoint concurrently.
+
+The first patched image, SHA-256
+`fd065c95adb6a0dcfe7555b54573061c79bf7435a9f92c320932a786661d7586`, changed
+only the fastboot device-to-host queue depth to one. A 4 MiB real-userdata
+upload still failed: the Deck's fastboot process returned `Protocol error`,
+and PocketBoot timed out one incomplete exact-AIO request after 30 seconds.
+The five `was not queued to ep3in` messages were gone, so serialization fixed
+the concurrent-queue rejection but was not sufficient for this link.
+
+The current focused
 [`0003-serialize-fastboot-upload-writes.patch`](../patches/pocketboot/0003-serialize-fastboot-upload-writes.patch)
-changes only the fastboot device-to-host endpoint direction to
-`queue_len=1`. It does not change the 16 KiB internal chunk, ADB, mass
-storage, fastboot host-to-device downloads, or any storage command. Hardware
-validation of that patched image is still required before trusting a large
-readback.
+keeps `queue_len=1` and slices every fastboot payload write into 4 KiB logical
+writes, matching the write size that survived the ADB probes. It does not
+change ADB, mass storage, fastboot host-to-device downloads, response packets,
+or any storage command. This combined version still requires hardware
+validation before trusting a large readback.
+
+The complete five-patch tree was cross-built inside the Deck's
+`fedora-latest` distrobox as tree
+`44064004402a606c642ee0be201e9bef17d6eb50`. The resulting image is
+`/home/deck/frankensargo-lab/pocketboot-current/pocketboot-sargo-lab.img`,
+SHA-256
+`c8bb396f544db569443ae1d69377b352a0c0716fd2aa2adb90fa9b98520cf9bf`.
+That build success is not a hardware readback result.
 
 Across all of these tests, `userdata` retained its original identity and
 content state: it was only read, never mounted read-write, erased, formatted,

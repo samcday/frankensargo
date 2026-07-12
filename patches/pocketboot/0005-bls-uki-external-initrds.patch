@@ -1,0 +1,585 @@
+diff --git a/src/bootflow.rs b/src/bootflow.rs
+index 5aad661bde2fd23054a1d64d10bf550394ba0dc1..730936ed1577e312c6411387a5259ae6dd95832f 100644
+--- a/src/bootflow.rs
++++ b/src/bootflow.rs
+@@ -36,6 +36,8 @@ const DIRECT_UKI_DIR: &str = "EFI/Linux";
+ /// Bound automatic UKI discovery and load-time staging on memory-constrained
+ /// devices. The limit is the logical file length, so sparse files do not evade it.
+ const MAX_UKI_FILE_BYTES: u64 = 256 * 1024 * 1024;
++const MAX_INITRD_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
++const INITRD_ALIGNMENT: u64 = 4;
+ const EXTLINUX_CONFIG_PATHS: [&str; 2] = ["extlinux/extlinux.conf", "boot/extlinux/extlinux.conf"];
+ const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
+ const GPT_MIN_HEADER_SIZE: usize = 92;
+@@ -113,6 +115,7 @@ enum BootPayload {
+         root: PathBuf,
+         path: PathBuf,
+         profile: usize,
++        external_initrds: Vec<PathBuf>,
+         discovered_cmdline: String,
+         cmdline_override: Option<String>,
+     },
+@@ -178,9 +181,16 @@ impl BootEntry {
+                 root,
+                 path,
+                 profile,
++                external_initrds,
+                 cmdline_override,
+                 ..
+-            } => load_uki(root, path, *profile, cmdline_override.as_deref()),
++            } => load_uki(
++                root,
++                path,
++                *profile,
++                external_initrds,
++                cmdline_override.as_deref(),
++            ),
+         }
+     }
+ }
+@@ -370,6 +380,134 @@ fn uki_size_limit_error(path: &Path, bytes: u64) -> io::Error {
+     ))
+ }
+ 
++fn open_external_initrd(root: &Path, path: &Path) -> io::Result<(File, u64)> {
++    verify_beneath_without_symlinks(root, path)?;
++    let file = OpenOptions::new()
++        .read(true)
++        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
++        .open(path)
++        .map_err(|err| {
++            io::Error::new(
++                err.kind(),
++                format!("open BLS initrd {}: {err}", path.display()),
++            )
++        })?;
++    let metadata = file.metadata().map_err(|err| {
++        io::Error::new(
++            err.kind(),
++            format!("stat BLS initrd {}: {err}", path.display()),
++        )
++    })?;
++    if !metadata.file_type().is_file() {
++        return Err(invalid_data(format!(
++            "BLS initrd is not a regular file: {}",
++            path.display()
++        )));
++    }
++    let bytes = metadata.len();
++    if bytes == 0 {
++        return Err(invalid_data(format!(
++            "BLS initrd is empty: {}",
++            path.display()
++        )));
++    }
++    if bytes > MAX_INITRD_PAYLOAD_BYTES {
++        return Err(initrd_size_limit_error(path, bytes));
++    }
++    Ok((file, bytes))
++}
++
++fn external_initrd_len(root: &Path, path: &Path) -> io::Result<u64> {
++    open_external_initrd(root, path).map(|(_, bytes)| bytes)
++}
++
++fn read_external_initrd_bounded(root: &Path, path: &Path) -> io::Result<Vec<u8>> {
++    let (file, expected) = open_external_initrd(root, path)?;
++    let initial_capacity = usize::try_from(expected.min(1024 * 1024))
++        .expect("bounded initial initrd capacity fits usize");
++    let mut data = Vec::with_capacity(initial_capacity);
++    file.take(expected + 1)
++        .read_to_end(&mut data)
++        .map_err(|err| {
++            io::Error::new(
++                err.kind(),
++                format!("read BLS initrd {}: {err}", path.display()),
++            )
++        })?;
++    if data.len() as u64 != expected {
++        return Err(invalid_data(format!(
++            "BLS initrd changed while reading: {}",
++            path.display()
++        )));
++    }
++    Ok(data)
++}
++
++fn append_external_initrds(
++    root: &Path,
++    embedded: &mut Option<Vec<u8>>,
++    paths: &[PathBuf],
++) -> io::Result<()> {
++    if paths.is_empty() {
++        return Ok(());
++    }
++
++    let mut combined = embedded.take().unwrap_or_default();
++    for path in paths {
++        let data = read_external_initrd_bounded(root, path)?;
++        append_initrd_component(&mut combined, &data)?;
++    }
++    *embedded = Some(combined);
++    Ok(())
++}
++
++fn append_initrd_component(combined: &mut Vec<u8>, component: &[u8]) -> io::Result<()> {
++    if component.is_empty() {
++        return Err(invalid_data("cannot append an empty initrd component"));
++    }
++    let current = combined.len() as u64;
++    let next = combined_initrd_len(current, component.len() as u64)?;
++    let padding = initrd_padding(current);
++    let next = usize::try_from(next)
++        .map_err(|_| invalid_data("combined initrd size does not fit memory"))?;
++    combined
++        .try_reserve_exact(next - combined.len())
++        .map_err(|err| invalid_data(format!("allocate combined initrd: {err}")))?;
++    // Linux's initramfs buffer grammar permits arbitrary NUL separators. Four
++    // byte alignment also satisfies the newc header/trailer alignment rule.
++    combined.resize(combined.len() + padding as usize, 0);
++    combined.extend_from_slice(component);
++    Ok(())
++}
++
++fn combined_initrd_len(current: u64, component: u64) -> io::Result<u64> {
++    let bytes = current
++        .checked_add(initrd_padding(current))
++        .and_then(|bytes| bytes.checked_add(component))
++        .ok_or_else(|| invalid_data("combined initrd size overflows"))?;
++    if bytes > MAX_INITRD_PAYLOAD_BYTES {
++        return Err(invalid_data(format!(
++            "combined initrd is {bytes} bytes, exceeding the 256 MiB limit"
++        )));
++    }
++    Ok(bytes)
++}
++
++fn initrd_padding(bytes: u64) -> u64 {
++    if bytes == 0 {
++        0
++    } else {
++        (INITRD_ALIGNMENT - bytes % INITRD_ALIGNMENT) % INITRD_ALIGNMENT
++    }
++}
++
++fn initrd_size_limit_error(path: &Path, bytes: u64) -> io::Error {
++    invalid_data(format!(
++        "BLS initrd {} is {bytes} bytes, exceeding the 256 MiB logical file limit",
++        path.display()
++    ))
++}
++
+ fn verify_beneath_without_symlinks(root: &Path, path: &Path) -> io::Result<()> {
+     let relative = path.strip_prefix(root).map_err(|_| {
+         invalid_data(format!(
+@@ -463,6 +601,7 @@ fn load_uki(
+     root: &Path,
+     path: &Path,
+     profile: usize,
++    external_initrds: &[PathBuf],
+     cmdline_override: Option<&str>,
+ ) -> io::Result<()> {
+     let live_dtb = fs::read(CURRENT_FDT_PATH).map_err(|err| {
+@@ -471,7 +610,14 @@ fn load_uki(
+             format!("read live DTB {CURRENT_FDT_PATH}: {err}"),
+         )
+     })?;
+-    let resolved = resolve_uki_file(root, path, profile, cmdline_override, Some(&live_dtb))?;
++    let resolved = resolve_uki_file(
++        root,
++        path,
++        profile,
++        external_initrds,
++        cmdline_override,
++        Some(&live_dtb),
++    )?;
+     let kernel = kexec::payload_from_bytes("uki-kernel", &resolved.linux)?;
+     let kernel = kexec::prepare_kernel_payload(kernel)?;
+     let initrd = resolved
+@@ -491,12 +637,17 @@ fn resolve_uki_file(
+     root: &Path,
+     path: &Path,
+     profile: usize,
++    external_initrds: &[PathBuf],
+     cmdline_override: Option<&str>,
+     live_dtb: Option<&[u8]>,
+ ) -> io::Result<ResolvedUkiPayload> {
+     let data = read_uki_file_bounded(root, path)?;
+-    resolve_uki_bytes(&data, profile, cmdline_override, live_dtb)
+-        .map_err(|err| io::Error::new(err.kind(), format!("parse UKI {}: {err}", path.display())))
++    let mut resolved =
++        resolve_uki_bytes(&data, profile, cmdline_override, live_dtb).map_err(|err| {
++            io::Error::new(err.kind(), format!("parse UKI {}: {err}", path.display()))
++        })?;
++    append_external_initrds(root, &mut resolved.initrd, external_initrds)?;
++    Ok(resolved)
+ }
+ 
+ fn resolve_uki_bytes(
+@@ -1738,6 +1889,7 @@ fn direct_uki_entries_for_file(
+                     root: root.to_path_buf(),
+                     path: path.to_path_buf(),
+                     profile: profile_index,
++                    external_initrds: Vec::new(),
+                     discovered_cmdline: profile.cmdline().unwrap_or_default().to_string(),
+                     cmdline_override: None,
+                 },
+@@ -2130,6 +2282,16 @@ fn bls_uki_boot_entry(
+             uki.profiles().len()
+         ))
+     })?;
++    let Some(external_initrds) = bls_uki_initrd_paths(
++        root,
++        source,
++        context,
++        bls,
++        profile.initrd().map_or(0, |initrd| initrd.len() as u64),
++    )?
++    else {
++        return Ok(None);
++    };
+ 
+     let filename = source
+         .file_name()
+@@ -2176,6 +2338,7 @@ fn bls_uki_boot_entry(
+             root: root.to_path_buf(),
+             path,
+             profile: profile_index,
++            external_initrds,
+             discovered_cmdline: profile.cmdline().unwrap_or_default().to_string(),
+             cmdline_override,
+         },
+@@ -2184,6 +2347,37 @@ fn bls_uki_boot_entry(
+     }))
+ }
+ 
++fn bls_uki_initrd_paths(
++    root: &Path,
++    source: &Path,
++    context: &BlsContext,
++    bls: &BlsSnippet,
++    mut combined_bytes: u64,
++) -> io::Result<Option<Vec<PathBuf>>> {
++    let mut paths = Vec::new();
++    for configured in &bls.initrds {
++        let expanded = context.expand(configured);
++        let words = split_bls_words(&expanded);
++        if words.is_empty() {
++            return Err(invalid_data("BLS UKI initrd value is empty"));
++        }
++        for value in words {
++            let path = resolve_boot_path(root, &value)?;
++            let bytes = match external_initrd_len(root, &path) {
++                Ok(bytes) => bytes,
++                Err(err) if err.kind() == io::ErrorKind::NotFound => {
++                    tracing::warn!(source = %source.display(), initrd = %path.display(), "BLS UKI initrd payload is missing");
++                    return Ok(None);
++                }
++                Err(err) => return Err(err),
++            };
++            combined_bytes = combined_initrd_len(combined_bytes, bytes)?;
++            paths.push(path);
++        }
++    }
++    Ok(Some(paths))
++}
++
+ fn bls_options(bls: &BlsSnippet, context: &BlsContext) -> Vec<String> {
+     bls.options
+         .iter()
+@@ -2374,12 +2568,11 @@ impl BlsSnippet {
+                 continue;
+             }
+ 
+-            let Some(split) = line.find(char::is_whitespace) else {
+-                continue;
+-            };
+-            let key = &line[..split];
+-            let value = line[split..].trim();
++            let (key, value) = split_key_value(line);
+             if value.is_empty() {
++                if key == "initrd" {
++                    snippet.initrds.push(String::new());
++                }
+                 continue;
+             }
+ 
+@@ -2849,6 +3042,29 @@ mod tests {
+         }
+     }
+ 
++    fn resolve_test_uki_entry(entry: &BootEntry) -> ResolvedUkiPayload {
++        let BootPayload::Uki {
++            root,
++            path,
++            profile,
++            external_initrds,
++            cmdline_override,
++            ..
++        } = &entry.payload
++        else {
++            panic!("expected UKI payload");
++        };
++        resolve_uki_file(
++            root,
++            path,
++            *profile,
++            external_initrds,
++            cmdline_override.as_deref(),
++            None,
++        )
++        .unwrap()
++    }
++
+     #[test]
+     fn parses_minimal_bls_entry() {
+         let snippet = BlsSnippet::parse(
+@@ -3041,7 +3257,7 @@ mod tests {
+         .unwrap_err();
+         assert!(err.to_string().contains("256 MiB logical file limit"));
+ 
+-        let err = resolve_uki_file(&temp.path, &path, 0, None, None).unwrap_err();
++        let err = resolve_uki_file(&temp.path, &path, 0, &[], None, None).unwrap_err();
+         assert!(err.to_string().contains("256 MiB logical file limit"));
+     }
+ 
+@@ -3090,6 +3306,7 @@ mod tests {
+             &temp.path,
+             path,
+             *profile,
++            &[],
+             cmdline_override.as_deref(),
+             None,
+         )
+@@ -3128,6 +3345,231 @@ mod tests {
+         assert!(cmdline_override.is_none());
+     }
+ 
++    #[test]
++    fn bls_uki_appends_one_external_initrd_after_embedded_initrd() {
++        let temp = TestDir::new("bls-uki-one-initrd");
++        let uki_path = temp.path.join("EFI/Linux/test-os.efi");
++        let initrd_path = temp.path.join("adapter.img");
++        let source = temp.path.join("loader/entries/one.conf");
++        std::fs::create_dir_all(uki_path.parent().unwrap()).unwrap();
++        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
++        std::fs::write(&uki_path, test_multi_profile_uki()).unwrap();
++        std::fs::write(&initrd_path, b"adapter").unwrap();
++        std::fs::write(&source, "uki /EFI/Linux/test-os.efi\ninitrd /adapter.img\n").unwrap();
++
++        let entry = parse_bls_file(
++            &test_partition(),
++            &temp.path,
++            &source,
++            &BlsContext::default(),
++        )
++        .unwrap()
++        .unwrap();
++        let resolved = resolve_test_uki_entry(&entry);
++
++        assert_eq!(
++            resolved.initrd.as_deref(),
++            Some(b"base-initrd\0adapter".as_slice())
++        );
++    }
++
++    #[test]
++    fn bls_uki_appends_multiple_external_initrds_in_bls_order() {
++        let temp = TestDir::new("bls-uki-multiple-initrds");
++        let uki_path = temp.path.join("EFI/Linux/test-os.efi");
++        let source = temp.path.join("loader/entries/multiple.conf");
++        std::fs::create_dir_all(uki_path.parent().unwrap()).unwrap();
++        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
++        std::fs::write(&uki_path, test_multi_profile_uki()).unwrap();
++        std::fs::write(temp.path.join("one.img"), b"one").unwrap();
++        std::fs::write(temp.path.join("two.img"), b"second").unwrap();
++        std::fs::write(
++            &source,
++            "uki /EFI/Linux/test-os.efi\ninitrd /one.img\ninitrd /two.img\n",
++        )
++        .unwrap();
++
++        let entry = parse_bls_file(
++            &test_partition(),
++            &temp.path,
++            &source,
++            &BlsContext::default(),
++        )
++        .unwrap()
++        .unwrap();
++        let BootPayload::Uki {
++            external_initrds, ..
++        } = &entry.payload
++        else {
++            panic!("expected UKI payload");
++        };
++        assert_eq!(
++            external_initrds,
++            &[temp.path.join("one.img"), temp.path.join("two.img")]
++        );
++        let resolved = resolve_test_uki_entry(&entry);
++        assert_eq!(
++            resolved.initrd.as_deref(),
++            Some(b"base-initrd\0one\0second".as_slice())
++        );
++    }
++
++    #[test]
++    fn bls_uki_rejects_empty_missing_and_symlinked_external_initrds() {
++        let temp = TestDir::new("bls-uki-invalid-initrds");
++        let uki_path = temp.path.join("EFI/Linux/test-os.efi");
++        let entries = temp.path.join("loader/entries");
++        std::fs::create_dir_all(uki_path.parent().unwrap()).unwrap();
++        std::fs::create_dir_all(&entries).unwrap();
++        std::fs::write(&uki_path, test_multi_profile_uki()).unwrap();
++
++        std::fs::write(temp.path.join("empty.img"), b"").unwrap();
++        let empty = entries.join("empty.conf");
++        std::fs::write(&empty, "uki /EFI/Linux/test-os.efi\ninitrd /empty.img\n").unwrap();
++        let err = parse_bls_file(
++            &test_partition(),
++            &temp.path,
++            &empty,
++            &BlsContext::default(),
++        )
++        .unwrap_err();
++        assert!(err.to_string().contains("initrd is empty"));
++
++        let empty_value = entries.join("empty-value.conf");
++        std::fs::write(&empty_value, "uki /EFI/Linux/test-os.efi\ninitrd\n").unwrap();
++        let err = parse_bls_file(
++            &test_partition(),
++            &temp.path,
++            &empty_value,
++            &BlsContext::default(),
++        )
++        .unwrap_err();
++        assert!(err.to_string().contains("initrd value is empty"));
++
++        let missing = entries.join("missing.conf");
++        std::fs::write(
++            &missing,
++            "uki /EFI/Linux/test-os.efi\ninitrd /missing.img\n",
++        )
++        .unwrap();
++        assert!(
++            parse_bls_file(
++                &test_partition(),
++                &temp.path,
++                &missing,
++                &BlsContext::default(),
++            )
++            .unwrap()
++            .is_none()
++        );
++
++        std::fs::write(temp.path.join("real.img"), b"real").unwrap();
++        symlink(temp.path.join("real.img"), temp.path.join("link.img")).unwrap();
++        let linked = entries.join("linked.conf");
++        std::fs::write(&linked, "uki /EFI/Linux/test-os.efi\ninitrd /link.img\n").unwrap();
++        let err = parse_bls_file(
++            &test_partition(),
++            &temp.path,
++            &linked,
++            &BlsContext::default(),
++        )
++        .unwrap_err();
++        assert!(err.to_string().contains("traverses a symlink"));
++    }
++
++    #[test]
++    fn bls_uki_rechecks_external_initrd_symlinks_at_load_time() {
++        let temp = TestDir::new("bls-uki-initrd-load-recheck");
++        let uki_path = temp.path.join("EFI/Linux/test-os.efi");
++        let initrd_path = temp.path.join("late.img");
++        let replacement = temp.path.join("replacement.img");
++        let source = temp.path.join("loader/entries/late.conf");
++        std::fs::create_dir_all(uki_path.parent().unwrap()).unwrap();
++        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
++        std::fs::write(&uki_path, test_multi_profile_uki()).unwrap();
++        std::fs::write(&initrd_path, b"original").unwrap();
++        std::fs::write(&replacement, b"replacement").unwrap();
++        std::fs::write(&source, "uki /EFI/Linux/test-os.efi\ninitrd /late.img\n").unwrap();
++        let entry = parse_bls_file(
++            &test_partition(),
++            &temp.path,
++            &source,
++            &BlsContext::default(),
++        )
++        .unwrap()
++        .unwrap();
++
++        std::fs::remove_file(&initrd_path).unwrap();
++        symlink(&replacement, &initrd_path).unwrap();
++        let BootPayload::Uki {
++            root,
++            path,
++            profile,
++            external_initrds,
++            cmdline_override,
++            ..
++        } = &entry.payload
++        else {
++            panic!("expected UKI payload");
++        };
++        let err = resolve_uki_file(
++            root,
++            path,
++            *profile,
++            external_initrds,
++            cmdline_override.as_deref(),
++            None,
++        )
++        .unwrap_err();
++        assert!(err.to_string().contains("traverses a symlink"));
++    }
++
++    #[test]
++    fn direct_uki_without_external_initrds_is_unchanged() {
++        let temp = TestDir::new("direct-uki-no-external-initrd");
++        let uki_path = temp.path.join("EFI/Linux/test-os.efi");
++        std::fs::create_dir_all(uki_path.parent().unwrap()).unwrap();
++        std::fs::write(&uki_path, test_multi_profile_uki()).unwrap();
++
++        let entries =
++            direct_uki_entries_for_file(&test_partition(), &temp.path, &uki_path).unwrap();
++        let BootPayload::Uki {
++            external_initrds, ..
++        } = &entries[0].payload
++        else {
++            panic!("expected UKI payload");
++        };
++        assert!(external_initrds.is_empty());
++        let resolved = resolve_test_uki_entry(&entries[0]);
++        assert_eq!(resolved.initrd.as_deref(), Some(b"base-initrd".as_slice()));
++    }
++
++    #[test]
++    fn bls_uki_rejects_combined_initrd_limit_and_arithmetic_overflow() {
++        let temp = TestDir::new("bls-uki-initrd-limit");
++        let uki_path = temp.path.join("EFI/Linux/test-os.efi");
++        let huge_path = temp.path.join("huge.img");
++        let source = temp.path.join("loader/entries/huge.conf");
++        std::fs::create_dir_all(uki_path.parent().unwrap()).unwrap();
++        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
++        std::fs::write(&uki_path, test_multi_profile_uki()).unwrap();
++        File::create(&huge_path)
++            .unwrap()
++            .set_len(MAX_INITRD_PAYLOAD_BYTES)
++            .unwrap();
++        std::fs::write(&source, "uki /EFI/Linux/test-os.efi\ninitrd /huge.img\n").unwrap();
++
++        let err = parse_bls_file(
++            &test_partition(),
++            &temp.path,
++            &source,
++            &BlsContext::default(),
++        )
++        .unwrap_err();
++        assert!(err.to_string().contains("combined initrd"));
++        assert!(combined_initrd_len(u64::MAX - 1, 8).is_err());
++    }
++
+     #[test]
+     fn bls_uki_rejects_profile_range_and_path_traversal_errors() {
+         let temp = TestDir::new("bls-uki-errors");

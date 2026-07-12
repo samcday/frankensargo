@@ -45,7 +45,7 @@ index 1f81f3359d8fc028c3124d38b0d909714a8fdcea..6341a9d0afb0a5bc0d225c7e866d8c9a
      ]
 diff --git a/src/fastboot/commands/pbread1.rs b/src/fastboot/commands/pbread1.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..5b737065ee657d6272f0aec950e23b67190d0e3b
+index 0000000000000000000000000000000000000000..a591ec24e72d50a9f2b4edb55791a535a032651e
 --- /dev/null
 +++ b/src/fastboot/commands/pbread1.rs
 @@ -0,0 +1,1303 @@
@@ -76,7 +76,7 @@ index 0000000000000000000000000000000000000000..5b737065ee657d6272f0aec950e23b67
 +const COPY_BYTES: usize = 1024 * 1024;
 +const HASH_PROGRESS_BYTES: u64 = 256 * 1024 * 1024;
 +const HASH_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
-+const BLKGETSIZE64: libc::Ioctl = 0x8008_1272;
++const BLKGETSIZE64: libc::Ioctl = 0x8008_1272u32 as libc::Ioctl;
 +const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
 +const GPT_HEADER_MIN_BYTES: usize = 92;
 +const GPT_ENTRY_MIN_BYTES: usize = 128;
