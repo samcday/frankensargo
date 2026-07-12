@@ -1,0 +1,1192 @@
+{
+  "action": "bootstrap-userdata-anchor",
+  "artifacts": {
+    "inventory": {
+      "canonical_sha256": "sha256:0202020202020202020202020202020202020202020202020202020202020202",
+      "file_sha256": "sha256:0101010101010101010101010101010101010101010101010101010101010101",
+      "schema": "org.frankensargo.inventory/1"
+    },
+    "pbread1": {
+      "journal_sha256": "sha256:0404040404040404040404040404040404040404040404040404040404040404",
+      "manifest_sha256": "sha256:0303030303030303030303030303030303030303030303030303030303030303",
+      "raw_sha256": "sha256:0505050505050505050505050505050505050505050505050505050505050505",
+      "run_uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "source_verified_at_utc": "2026-07-12T00:00:00Z",
+      "status": "source-matched"
+    },
+    "pocketboot": {
+      "image_bytes": "8000000",
+      "image_name": "pocketboot-sargo-lab.img",
+      "image_sha256": "sha256:0606060606060606060606060606060606060606060606060606060606060606"
+    }
+  },
+  "authorization_sha256": "sha256:c39900f4b073962a0a6eab3269a0bf8348f5e0a20489c6a07817442a55f5d661",
+  "confirmation": {
+    "required_by_future_executor": true,
+    "token": "BOOTSTRAP-01234567-c39900f4b073"
+  },
+  "device": {
+    "compatible": "google,sargo",
+    "emmc_cid": "07070707070707070707070707070707",
+    "fastboot_serial": "SYNTHETIC-SARGO",
+    "gpt_backup_header_sha256": "sha256:0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "gpt_disk_guid": "00000000-0000-0000-0000-000000000000",
+    "gpt_entry_array_sha256": "sha256:0808080808080808080808080808080808080808080808080808080808080808",
+    "gpt_primary_header_sha256": "sha256:0909090909090909090909090909090909090909090909090909090909090909",
+    "product": "sargo"
+  },
+  "lvm": {
+    "capacity": {
+      "conservative_extent_capacity_after_budget_bytes": "53578039296",
+      "duranium_virtual_bytes": "21474836480",
+      "extent_rounding_tail_bytes": "3653120",
+      "mandatory_recovery_reserve_bytes": "17179869184",
+      "partition_bytes": "53648801280",
+      "planned_free_extents_after_allocations_bytes": "19486736384",
+      "planned_physical_lv_bytes": "34091302912",
+      "pv_metadata_alignment_budget_bytes": "67108864",
+      "uncommitted_slack_beyond_reserve_bytes": "2306867200"
+    },
+    "lv_uuid_policy": "lvm-generated-capture-and-fsync-after-each-create",
+    "physical_extent_bytes": "4194304",
+    "pv": {
+      "data_alignment_bytes": "1048576",
+      "metadata_area_bytes_each": "16777216",
+      "metadata_copies": 2,
+      "planned_uuid": "A1b2C3-d4E5-f6G7-h8J9-k0L1-m2N3-o4P5Q6",
+      "tags": [
+        "greygoo.anchor",
+        "pocketboot.pv.v1"
+      ],
+      "uuid_policy": "operator-generated-random-and-frozen-before-first-write"
+    },
+    "thin_pool": {
+      "automatic_metadata_spare": true,
+      "chunk_bytes": "262144",
+      "discard_policy": "nopassdown",
+      "error_when_full": true,
+      "managed_spare_lv": "lvol0_pmspare",
+      "name": "pool"
+    },
+    "vg_name": "franken",
+    "vg_tags": [
+      "pocketboot.vg.v1"
+    ],
+    "vg_uuid_policy": "lvm-generated-capture-and-fsync-before-next-mutation",
+    "volumes": [
+      {
+        "allocation": {
+          "partuuid": "11111111-2222-4333-8444-555555555555",
+          "policy": "exact-anchor-pv-only"
+        },
+        "critical": true,
+        "kind": "thick",
+        "name": "ggmeta",
+        "role": "transaction-metadata",
+        "size_bytes": "536870912",
+        "tags": [
+          "greygoo.critical",
+          "pocketboot.meta.v1"
+        ],
+        "virtual_bytes": null
+      },
+      {
+        "allocation": {
+          "partuuid": "11111111-2222-4333-8444-555555555555",
+          "policy": "exact-anchor-pv-only"
+        },
+        "critical": true,
+        "kind": "thick",
+        "name": "boot-rescue",
+        "role": "rescue-boot-filesystem",
+        "size_bytes": "2147483648",
+        "tags": [
+          "greygoo.critical",
+          "pocketboot.bootfs.v1"
+        ],
+        "virtual_bytes": null
+      },
+      {
+        "allocation": {
+          "partuuid": "11111111-2222-4333-8444-555555555555",
+          "policy": "exact-anchor-pv-only"
+        },
+        "critical": true,
+        "kind": "thick",
+        "name": "home",
+        "role": "shared-homed-backing-store",
+        "size_bytes": "8589934592",
+        "tags": [
+          "frankensargo.home.v1",
+          "greygoo.critical"
+        ],
+        "virtual_bytes": null
+      },
+      {
+        "allocation": {
+          "partuuid": "11111111-2222-4333-8444-555555555555",
+          "policy": "exact-anchor-pv-only"
+        },
+        "critical": true,
+        "kind": "thick",
+        "name": "homed-state",
+        "role": "shared-homed-records-and-keys",
+        "size_bytes": "268435456",
+        "tags": [
+          "frankensargo.homed-state.v1",
+          "greygoo.critical"
+        ],
+        "virtual_bytes": null
+      },
+      {
+        "allocation": {
+          "partuuid": "11111111-2222-4333-8444-555555555555",
+          "policy": "exact-anchor-pv-only"
+        },
+        "critical": true,
+        "kind": "thin-metadata",
+        "name": "pool-meta",
+        "role": "thin-pool-metadata",
+        "size_bytes": "536870912",
+        "tags": [
+          "greygoo.critical",
+          "greygoo.thin-metadata.v1"
+        ],
+        "virtual_bytes": null
+      },
+      {
+        "allocation": {
+          "partuuid": "11111111-2222-4333-8444-555555555555",
+          "policy": "exact-anchor-pv-only"
+        },
+        "critical": true,
+        "kind": "thin-metadata-spare",
+        "name": "lvol0_pmspare",
+        "role": "lvm-managed-thin-metadata-spare",
+        "size_bytes": "536870912",
+        "tags": [],
+        "virtual_bytes": null
+      },
+      {
+        "allocation": {
+          "partuuid": "11111111-2222-4333-8444-555555555555",
+          "policy": "exact-anchor-pv-only"
+        },
+        "critical": false,
+        "kind": "thin-data",
+        "name": "pool",
+        "role": "thin-pool-data",
+        "size_bytes": "21474836480",
+        "tags": [
+          "greygoo.replaceable",
+          "greygoo.thin-pool.v1"
+        ],
+        "virtual_bytes": null
+      },
+      {
+        "allocation": {
+          "policy": "thin-only",
+          "thin_pool": "pool"
+        },
+        "critical": false,
+        "kind": "thin",
+        "name": "disk-duranium",
+        "role": "duranium-whole-disk",
+        "size_bytes": "0",
+        "tags": [
+          "distro.duranium",
+          "greygoo.import-pending",
+          "greygoo.replaceable"
+        ],
+        "virtual_bytes": "21474836480"
+      }
+    ]
+  },
+  "operation_uuid": "01234567-89ab-4cde-8f01-23456789abcd",
+  "partition": {
+    "current_full_source_sha256": "sha256:0505050505050505050505050505050505050505050505050505050505050505",
+    "kernel_name_observation": "mmcblk0p72",
+    "logical_sector_bytes": 512,
+    "partlabel": "userdata",
+    "partuuid": "11111111-2222-4333-8444-555555555555",
+    "raw_bytes": "53648801280",
+    "sectors": "104782815",
+    "start_lba": "17359872",
+    "type_guid": "1b81e7e6-f50d-419b-a739-2aeef8da3335"
+  },
+  "planner_effect": "read-files-and-emit-json-only",
+  "schema": "org.frankensargo.bootstrap-plan/1",
+  "transaction": {
+    "command_argv": [
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "pvcreate",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--yes",
+          "--force",
+          "--force",
+          "--uuid",
+          "A1b2C3-d4E5-f6G7-h8J9-k0L1-m2N3-o4P5Q6",
+          "--norestorefile",
+          "--zero",
+          "y",
+          "--dataalignment",
+          "1m",
+          "--metadatasize",
+          "16m",
+          "--pvmetadatacopies",
+          "2",
+          "@USERDATA_BLOCK_DEVICE@"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "pv_uuid",
+            "pv_name",
+            "pv_size",
+            "pv_free",
+            "pv_tags"
+          ],
+          "expected_after": [
+            "bound-partition-is-exact-planned-pv"
+          ],
+          "expected_before": [
+            "bound-partition-has-no-lvm-signature",
+            "franken-vg-is-absent"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 1,
+          "remote_capture": null,
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/01-create-anchor-pv.json",
+          "vgcfgbackup_argv": null
+        },
+        "destructive": true,
+        "step": "create-anchor-pv"
+      },
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "vgcreate",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--yes",
+          "--physicalextentsize",
+          "4m",
+          "--setautoactivation",
+          "n",
+          "--addtag",
+          "pocketboot.vg.v1",
+          "franken",
+          "@USERDATA_BLOCK_DEVICE@"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "pv_uuid",
+            "vg_uuid",
+            "vg_name",
+            "vg_extent_size",
+            "vg_tags"
+          ],
+          "expected_after": [
+            "franken-vg-exists-on-exact-planned-pv"
+          ],
+          "expected_before": [
+            "planned-pv-exists-unassigned",
+            "franken-vg-is-absent"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 2,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/02-create-anchor-vg.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/02-create-anchor-vg.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/02-create-anchor-vg.json",
+          "vgcfgbackup_argv": [
+            "/sbin/lvm.static",
+            "vgcfgbackup",
+            "--devices",
+            "@USERDATA_BLOCK_DEVICE@",
+            "--nohints",
+            "--config",
+            "backup/backup=0 backup/archive=0",
+            "--readonly",
+            "--file",
+            "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/02-create-anchor-vg.vgcfg",
+            "franken"
+          ]
+        },
+        "destructive": true,
+        "step": "create-anchor-vg"
+      },
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "pvchange",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--yes",
+          "--addtag",
+          "greygoo.anchor",
+          "--addtag",
+          "pocketboot.pv.v1",
+          "@USERDATA_BLOCK_DEVICE@"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "pv_uuid",
+            "pv_name",
+            "pv_tags",
+            "vg_uuid"
+          ],
+          "expected_after": [
+            "planned-pv-has-exact-anchor-tags"
+          ],
+          "expected_before": [
+            "franken-vg-and-planned-pv-match-checkpoints"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 3,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/03-tag-anchor-pv.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/03-tag-anchor-pv.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/03-tag-anchor-pv.json",
+          "vgcfgbackup_argv": [
+            "/sbin/lvm.static",
+            "vgcfgbackup",
+            "--devices",
+            "@USERDATA_BLOCK_DEVICE@",
+            "--nohints",
+            "--config",
+            "backup/backup=0 backup/archive=0",
+            "--readonly",
+            "--file",
+            "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/03-tag-anchor-pv.vgcfg",
+            "franken"
+          ]
+        },
+        "destructive": true,
+        "step": "tag-anchor-pv"
+      },
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "lvcreate",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--yes",
+          "--activate",
+          "n",
+          "--permission",
+          "rw",
+          "--wipesignatures",
+          "n",
+          "--zero",
+          "n",
+          "--contiguous",
+          "y",
+          "--size",
+          "512m",
+          "--name",
+          "ggmeta",
+          "--addtag",
+          "greygoo.critical",
+          "--addtag",
+          "pocketboot.meta.v1",
+          "franken",
+          "@USERDATA_BLOCK_DEVICE@"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "lv_uuid",
+            "lv_name",
+            "lv_size",
+            "lv_tags",
+            "lv_attr",
+            "segtype",
+            "devices",
+            "vg_uuid"
+          ],
+          "expected_after": [
+            "ggmeta-lv-has-exact-size-tags-and-anchor-placement"
+          ],
+          "expected_before": [
+            "franken-vg-and-planned-pv-match-checkpoints",
+            "ggmeta-lv-is-absent"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 4,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/04-create-ggmeta.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/04-create-ggmeta.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/04-create-ggmeta.json",
+          "vgcfgbackup_argv": [
+            "/sbin/lvm.static",
+            "vgcfgbackup",
+            "--devices",
+            "@USERDATA_BLOCK_DEVICE@",
+            "--nohints",
+            "--config",
+            "backup/backup=0 backup/archive=0",
+            "--readonly",
+            "--file",
+            "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/04-create-ggmeta.vgcfg",
+            "franken"
+          ]
+        },
+        "destructive": true,
+        "step": "create-ggmeta"
+      },
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "lvcreate",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--yes",
+          "--activate",
+          "n",
+          "--permission",
+          "rw",
+          "--wipesignatures",
+          "n",
+          "--zero",
+          "n",
+          "--contiguous",
+          "y",
+          "--size",
+          "2g",
+          "--name",
+          "boot-rescue",
+          "--addtag",
+          "greygoo.critical",
+          "--addtag",
+          "pocketboot.bootfs.v1",
+          "franken",
+          "@USERDATA_BLOCK_DEVICE@"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "lv_uuid",
+            "lv_name",
+            "lv_size",
+            "lv_tags",
+            "lv_attr",
+            "segtype",
+            "devices",
+            "vg_uuid"
+          ],
+          "expected_after": [
+            "boot-rescue-lv-has-exact-size-tags-and-anchor-placement"
+          ],
+          "expected_before": [
+            "franken-vg-and-planned-pv-match-checkpoints",
+            "boot-rescue-lv-is-absent"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 5,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/05-create-boot-rescue.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/05-create-boot-rescue.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/05-create-boot-rescue.json",
+          "vgcfgbackup_argv": [
+            "/sbin/lvm.static",
+            "vgcfgbackup",
+            "--devices",
+            "@USERDATA_BLOCK_DEVICE@",
+            "--nohints",
+            "--config",
+            "backup/backup=0 backup/archive=0",
+            "--readonly",
+            "--file",
+            "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/05-create-boot-rescue.vgcfg",
+            "franken"
+          ]
+        },
+        "destructive": true,
+        "step": "create-boot-rescue"
+      },
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "lvcreate",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--yes",
+          "--activate",
+          "n",
+          "--permission",
+          "rw",
+          "--wipesignatures",
+          "n",
+          "--zero",
+          "n",
+          "--contiguous",
+          "y",
+          "--size",
+          "8g",
+          "--name",
+          "home",
+          "--addtag",
+          "frankensargo.home.v1",
+          "--addtag",
+          "greygoo.critical",
+          "franken",
+          "@USERDATA_BLOCK_DEVICE@"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "lv_uuid",
+            "lv_name",
+            "lv_size",
+            "lv_tags",
+            "lv_attr",
+            "segtype",
+            "devices",
+            "vg_uuid"
+          ],
+          "expected_after": [
+            "home-lv-has-exact-size-tags-and-anchor-placement"
+          ],
+          "expected_before": [
+            "franken-vg-and-planned-pv-match-checkpoints",
+            "home-lv-is-absent"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 6,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/06-create-home.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/06-create-home.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/06-create-home.json",
+          "vgcfgbackup_argv": [
+            "/sbin/lvm.static",
+            "vgcfgbackup",
+            "--devices",
+            "@USERDATA_BLOCK_DEVICE@",
+            "--nohints",
+            "--config",
+            "backup/backup=0 backup/archive=0",
+            "--readonly",
+            "--file",
+            "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/06-create-home.vgcfg",
+            "franken"
+          ]
+        },
+        "destructive": true,
+        "step": "create-home"
+      },
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "lvcreate",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--yes",
+          "--activate",
+          "n",
+          "--permission",
+          "rw",
+          "--wipesignatures",
+          "n",
+          "--zero",
+          "n",
+          "--contiguous",
+          "y",
+          "--size",
+          "256m",
+          "--name",
+          "homed-state",
+          "--addtag",
+          "frankensargo.homed-state.v1",
+          "--addtag",
+          "greygoo.critical",
+          "franken",
+          "@USERDATA_BLOCK_DEVICE@"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "lv_uuid",
+            "lv_name",
+            "lv_size",
+            "lv_tags",
+            "lv_attr",
+            "segtype",
+            "devices",
+            "vg_uuid"
+          ],
+          "expected_after": [
+            "homed-state-lv-has-exact-size-tags-and-anchor-placement"
+          ],
+          "expected_before": [
+            "franken-vg-and-planned-pv-match-checkpoints",
+            "homed-state-lv-is-absent"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 7,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/07-create-homed-state.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/07-create-homed-state.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/07-create-homed-state.json",
+          "vgcfgbackup_argv": [
+            "/sbin/lvm.static",
+            "vgcfgbackup",
+            "--devices",
+            "@USERDATA_BLOCK_DEVICE@",
+            "--nohints",
+            "--config",
+            "backup/backup=0 backup/archive=0",
+            "--readonly",
+            "--file",
+            "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/07-create-homed-state.vgcfg",
+            "franken"
+          ]
+        },
+        "destructive": true,
+        "step": "create-homed-state"
+      },
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "lvcreate",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--yes",
+          "--activate",
+          "n",
+          "--permission",
+          "rw",
+          "--wipesignatures",
+          "n",
+          "--zero",
+          "n",
+          "--contiguous",
+          "y",
+          "--size",
+          "512m",
+          "--name",
+          "pool-meta",
+          "--addtag",
+          "greygoo.critical",
+          "--addtag",
+          "greygoo.thin-metadata.v1",
+          "franken",
+          "@USERDATA_BLOCK_DEVICE@"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "lv_uuid",
+            "lv_name",
+            "lv_size",
+            "lv_tags",
+            "lv_attr",
+            "segtype",
+            "devices",
+            "vg_uuid"
+          ],
+          "expected_after": [
+            "pool-meta-lv-has-exact-size-tags-and-anchor-placement"
+          ],
+          "expected_before": [
+            "franken-vg-and-planned-pv-match-checkpoints",
+            "pool-meta-lv-is-absent"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 8,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/08-create-pool-meta.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/08-create-pool-meta.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/08-create-pool-meta.json",
+          "vgcfgbackup_argv": [
+            "/sbin/lvm.static",
+            "vgcfgbackup",
+            "--devices",
+            "@USERDATA_BLOCK_DEVICE@",
+            "--nohints",
+            "--config",
+            "backup/backup=0 backup/archive=0",
+            "--readonly",
+            "--file",
+            "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/08-create-pool-meta.vgcfg",
+            "franken"
+          ]
+        },
+        "destructive": true,
+        "step": "create-pool-meta"
+      },
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "lvcreate",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--yes",
+          "--activate",
+          "n",
+          "--permission",
+          "rw",
+          "--wipesignatures",
+          "n",
+          "--zero",
+          "n",
+          "--contiguous",
+          "y",
+          "--size",
+          "20g",
+          "--name",
+          "pool",
+          "--addtag",
+          "greygoo.replaceable",
+          "--addtag",
+          "greygoo.thin-pool.v1",
+          "franken",
+          "@USERDATA_BLOCK_DEVICE@"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "lv_uuid",
+            "lv_name",
+            "lv_size",
+            "lv_tags",
+            "lv_attr",
+            "segtype",
+            "devices",
+            "vg_uuid"
+          ],
+          "expected_after": [
+            "pool-lv-has-exact-size-tags-and-anchor-placement"
+          ],
+          "expected_before": [
+            "franken-vg-and-planned-pv-match-checkpoints",
+            "pool-lv-is-absent"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 9,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/09-create-pool.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/09-create-pool.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/09-create-pool.json",
+          "vgcfgbackup_argv": [
+            "/sbin/lvm.static",
+            "vgcfgbackup",
+            "--devices",
+            "@USERDATA_BLOCK_DEVICE@",
+            "--nohints",
+            "--config",
+            "backup/backup=0 backup/archive=0",
+            "--readonly",
+            "--file",
+            "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/09-create-pool.vgcfg",
+            "franken"
+          ]
+        },
+        "destructive": true,
+        "step": "create-pool"
+      },
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "lvconvert",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--yes",
+          "--type",
+          "thin-pool",
+          "--chunksize",
+          "256k",
+          "--poolmetadata",
+          "franken/pool-meta",
+          "--poolmetadataspare",
+          "y",
+          "--discards",
+          "nopassdown",
+          "--errorwhenfull",
+          "y",
+          "franken/pool",
+          "@USERDATA_BLOCK_DEVICE@"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "pool_lv_uuid",
+            "pool_tdata_lv_uuid",
+            "pool_tmeta_lv_uuid",
+            "pmspare_lv_uuid",
+            "lv_size",
+            "lv_tags",
+            "lv_attr",
+            "segtype",
+            "devices",
+            "vg_uuid"
+          ],
+          "expected_after": [
+            "pool-is-exact-thin-pool",
+            "pool-tmeta-and-lvol0-pmspare-are-anchor-pinned"
+          ],
+          "expected_before": [
+            "pool-and-pool-meta-match-checkpoints",
+            "thin-pool-and-pmspare-are-absent"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 10,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/10-convert-thin-pool.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/10-convert-thin-pool.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/10-convert-thin-pool.json",
+          "vgcfgbackup_argv": [
+            "/sbin/lvm.static",
+            "vgcfgbackup",
+            "--devices",
+            "@USERDATA_BLOCK_DEVICE@",
+            "--nohints",
+            "--config",
+            "backup/backup=0 backup/archive=0",
+            "--readonly",
+            "--file",
+            "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/10-convert-thin-pool.vgcfg",
+            "franken"
+          ]
+        },
+        "destructive": true,
+        "step": "convert-thin-pool"
+      },
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "lvcreate",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--yes",
+          "--activate",
+          "n",
+          "--permission",
+          "rw",
+          "--zero",
+          "n",
+          "--type",
+          "thin",
+          "--thinpool",
+          "pool",
+          "--virtualsize",
+          "20g",
+          "--name",
+          "disk-duranium",
+          "--addtag",
+          "distro.duranium",
+          "--addtag",
+          "greygoo.import-pending",
+          "--addtag",
+          "greygoo.replaceable",
+          "franken"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "lv_uuid",
+            "lv_name",
+            "lv_size",
+            "lv_tags",
+            "lv_attr",
+            "segtype",
+            "pool_lv_uuid",
+            "vg_uuid"
+          ],
+          "expected_after": [
+            "disk-duranium-is-exact-import-pending-thin-lv"
+          ],
+          "expected_before": [
+            "pool-thin-layout-matches-checkpoint",
+            "disk-duranium-lv-is-absent"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 11,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/11-create-duranium-thin-disk.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/11-create-duranium-thin-disk.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/11-create-duranium-thin-disk.json",
+          "vgcfgbackup_argv": [
+            "/sbin/lvm.static",
+            "vgcfgbackup",
+            "--devices",
+            "@USERDATA_BLOCK_DEVICE@",
+            "--nohints",
+            "--config",
+            "backup/backup=0 backup/archive=0",
+            "--readonly",
+            "--file",
+            "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/11-create-duranium-thin-disk.vgcfg",
+            "franken"
+          ]
+        },
+        "destructive": true,
+        "step": "create-duranium-thin-disk"
+      },
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "vgcfgbackup",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--readonly",
+          "--file",
+          "@POCKETBOOT_VOLATILE_STATE_DIR@/franken.vgcfg",
+          "franken"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "vg_uuid",
+            "vgcfgbackup_sha256"
+          ],
+          "expected_after": [
+            "durable-vgcfgbackup-matches-live-vg-metadata"
+          ],
+          "expected_before": [
+            "complete-lvm-layout-matches-all-checkpoints"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 12,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/franken.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/franken.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/12-backup-vg-metadata.json",
+          "vgcfgbackup_argv": null
+        },
+        "destructive": false,
+        "step": "backup-vg-metadata"
+      }
+    ],
+    "device_placeholder": "@USERDATA_BLOCK_DEVICE@",
+    "execution_policy": "one-command-then-verify-and-fsync-checkpoint-never-blind-replay",
+    "host_state_directory_placeholder": "@HOST_DURABLE_STATE_DIR@",
+    "lvm_binary": "/sbin/lvm.static",
+    "placement_assertions": {
+      "all_physical_extents_userdata_only": true,
+      "allowed_physical_partuuids": [
+        "11111111-2222-4333-8444-555555555555"
+      ],
+      "automatic_allocation_from_future_pvs": false,
+      "critical_extents_userdata_pinned": true,
+      "thin_metadata_and_spare_userdata_pinned": true
+    },
+    "pocketboot_volatile_state_directory_placeholder": "@POCKETBOOT_VOLATILE_STATE_DIR@",
+    "post_import_argv": [
+      {
+        "argv": [
+          "/sbin/lvm.static",
+          "lvchange",
+          "--devices",
+          "@USERDATA_BLOCK_DEVICE@",
+          "--nohints",
+          "--config",
+          "backup/backup=0 backup/archive=0",
+          "--permission",
+          "r",
+          "--deltag",
+          "greygoo.import-pending",
+          "--addtag",
+          "pocketboot.disk.v1",
+          "franken/disk-duranium"
+        ],
+        "checkpoint": {
+          "capture_fields": [
+            "lv_uuid",
+            "lv_name",
+            "lv_tags",
+            "lv_attr",
+            "pool_lv_uuid",
+            "vg_uuid"
+          ],
+          "expected_after": [
+            "disk-duranium-is-read-only-published-pocketboot-disk"
+          ],
+          "expected_before": [
+            "disk-duranium-import-is-complete-and-readback-hash-verified",
+            "disk-duranium-is-exact-import-pending-thin-lv"
+          ],
+          "fsync_before_next_step": true,
+          "ordinal": 13,
+          "remote_capture": {
+            "hash": "sha256",
+            "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/13-publish-verified-duranium-disk.vgcfg",
+            "pull_hash_and_fsync_before_next_step": true,
+            "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/13-publish-verified-duranium-disk.vgcfg"
+          },
+          "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+          "state_file": "@HOST_DURABLE_STATE_DIR@/steps/13-publish-verified-duranium-disk.json",
+          "vgcfgbackup_argv": [
+            "/sbin/lvm.static",
+            "vgcfgbackup",
+            "--devices",
+            "@USERDATA_BLOCK_DEVICE@",
+            "--nohints",
+            "--config",
+            "backup/backup=0 backup/archive=0",
+            "--readonly",
+            "--file",
+            "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/13-publish-verified-duranium-disk.vgcfg",
+            "franken"
+          ]
+        },
+        "step": "publish-verified-duranium-disk"
+      }
+    ],
+    "preconditions": [
+      "resolve-device-placeholder-by-exact-sysfs-partuuid-scan-and-recheck-all-bound-identity",
+      "rehash-complete-live-source-with-pbread1-oem-hash-and-match-current-full-source-sha256",
+      "pull-and-hash-runtime-files-and-match-lvm-version-before-first-write",
+      "persist-and-fsync-bootstrap-intent-before-first-command",
+      "record-manual-stock-fastboot-and-sysrq-recovery-attestation-before-first-command",
+      "require-explicit-confirmation-token-in-a-separate-executor"
+    ],
+    "recovery_gate": "manual-out-of-band-operator-attestation-required",
+    "runtime_artifacts": {
+      "lvm_conf": {
+        "bytes": "432",
+        "path": "/etc/lvm/lvm.conf",
+        "sha256": "sha256:16eb1787836608cfaff40aa904705b2138928010b1b4011e4ab981b4d43e2998"
+      },
+      "lvm_static": {
+        "bytes": "2309032",
+        "path": "/sbin/lvm.static",
+        "sha256": "sha256:b83d704df60ca281deb56f1704d74db731a05365e90d0162556b2c355b572d39",
+        "version": "2.03.35"
+      }
+    },
+    "runtime_attestation_policy": "pull-and-match-exact-runtime-files-and-lvm-version-before-first-write",
+    "verification_argv": [
+      [
+        "/sbin/lvm.static",
+        "pvs",
+        "--devices",
+        "@USERDATA_BLOCK_DEVICE@",
+        "--nohints",
+        "--config",
+        "backup/backup=0 backup/archive=0",
+        "--readonly",
+        "--nolocking",
+        "--reportformat",
+        "json_std",
+        "--units",
+        "b",
+        "--nosuffix",
+        "-o",
+        "pv_uuid,pv_name,dev_size,pv_size,pv_free,pe_start,pv_mda_size,pv_mda_free,pv_mda_count,pv_mda_used_count,pv_pe_count,pv_pe_alloc_count,pv_tags,vg_uuid,vg_name",
+        "@USERDATA_BLOCK_DEVICE@"
+      ],
+      [
+        "/sbin/lvm.static",
+        "vgs",
+        "--devices",
+        "@USERDATA_BLOCK_DEVICE@",
+        "--nohints",
+        "--config",
+        "backup/backup=0 backup/archive=0",
+        "--readonly",
+        "--nolocking",
+        "--reportformat",
+        "json_std",
+        "-o",
+        "vg_uuid,vg_name,vg_size,vg_free,vg_extent_size,vg_extent_count,vg_free_count,pv_count,lv_count,vg_missing_pv_count,vg_mda_count,vg_mda_used_count,vg_autoactivation,vg_tags",
+        "franken"
+      ],
+      [
+        "/sbin/lvm.static",
+        "lvs",
+        "--devices",
+        "@USERDATA_BLOCK_DEVICE@",
+        "--nohints",
+        "--config",
+        "backup/backup=0 backup/archive=0",
+        "--readonly",
+        "--nolocking",
+        "--reportformat",
+        "json_std",
+        "--units",
+        "b",
+        "--nosuffix",
+        "--segments",
+        "-a",
+        "-o",
+        "vg_uuid,lv_uuid,lv_name,lv_size,lv_active,lv_permissions,segtype,seg_start_pe,seg_size_pe,devices,metadata_devices,data_lv_uuid,metadata_lv_uuid,pool_lv_uuid,lv_tags,lv_attr,chunk_size",
+        "franken"
+      ]
+    ]
+  }
+}

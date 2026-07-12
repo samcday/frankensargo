@@ -1,0 +1,2613 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:frankensargo:bootstrap-plan:1",
+  "title": "Frankensargo userdata-anchor bootstrap plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "action",
+    "artifacts",
+    "authorization_sha256",
+    "confirmation",
+    "device",
+    "lvm",
+    "operation_uuid",
+    "partition",
+    "planner_effect",
+    "schema",
+    "transaction"
+  ],
+  "properties": {
+    "schema": {
+      "const": "org.frankensargo.bootstrap-plan/1"
+    },
+    "action": {
+      "const": "bootstrap-userdata-anchor"
+    },
+    "planner_effect": {
+      "const": "read-files-and-emit-json-only"
+    },
+    "operation_uuid": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "authorization_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "confirmation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required_by_future_executor",
+        "token"
+      ],
+      "properties": {
+        "required_by_future_executor": {
+          "const": true
+        },
+        "token": {
+          "type": "string",
+          "pattern": "^BOOTSTRAP-[0-9a-f]{8}-[0-9a-f]{12}$"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inventory",
+        "pbread1",
+        "pocketboot"
+      ],
+      "properties": {
+        "inventory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "canonical_sha256",
+            "file_sha256",
+            "schema"
+          ],
+          "properties": {
+            "schema": {
+              "const": "org.frankensargo.inventory/1"
+            },
+            "canonical_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "file_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        "pbread1": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "journal_sha256",
+            "manifest_sha256",
+            "raw_sha256",
+            "run_uuid",
+            "source_verified_at_utc",
+            "status"
+          ],
+          "properties": {
+            "journal_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "manifest_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "raw_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "run_uuid": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source_verified_at_utc": {
+              "type": "string",
+              "minLength": 1
+            },
+            "status": {
+              "const": "source-matched"
+            }
+          }
+        },
+        "pocketboot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "image_bytes",
+            "image_name",
+            "image_sha256"
+          ],
+          "properties": {
+            "image_bytes": {
+              "$ref": "#/$defs/positiveDecimal"
+            },
+            "image_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "image_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        }
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "compatible",
+        "emmc_cid",
+        "fastboot_serial",
+        "gpt_backup_header_sha256",
+        "gpt_disk_guid",
+        "gpt_entry_array_sha256",
+        "gpt_primary_header_sha256",
+        "product"
+      ],
+      "properties": {
+        "product": {
+          "const": "sargo"
+        },
+        "compatible": {
+          "const": "google,sargo"
+        },
+        "fastboot_serial": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._:][A-Za-z0-9._:-]*$"
+        },
+        "emmc_cid": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "gpt_disk_guid": {
+          "const": "00000000-0000-0000-0000-000000000000"
+        },
+        "gpt_entry_array_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "gpt_primary_header_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "gpt_backup_header_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "partition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "current_full_source_sha256",
+        "kernel_name_observation",
+        "logical_sector_bytes",
+        "partlabel",
+        "partuuid",
+        "raw_bytes",
+        "sectors",
+        "start_lba",
+        "type_guid"
+      ],
+      "properties": {
+        "partuuid": {
+          "$ref": "#/$defs/nonzeroUuid"
+        },
+        "type_guid": {
+          "const": "1b81e7e6-f50d-419b-a739-2aeef8da3335"
+        },
+        "partlabel": {
+          "const": "userdata"
+        },
+        "kernel_name_observation": {
+          "type": "string",
+          "pattern": "^mmcblk[0-9]+p[1-9][0-9]*$"
+        },
+        "start_lba": {
+          "$ref": "#/$defs/positiveDecimal"
+        },
+        "sectors": {
+          "$ref": "#/$defs/positiveDecimal"
+        },
+        "logical_sector_bytes": {
+          "const": 512
+        },
+        "raw_bytes": {
+          "const": "53648801280"
+        },
+        "current_full_source_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "lvm": {
+      "$ref": "#/$defs/lvm"
+    },
+    "transaction": {
+      "$ref": "#/$defs/transaction"
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "uuid4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "nonzeroUuid": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/uuid"
+        },
+        {
+          "not": {
+            "const": "00000000-0000-0000-0000-000000000000"
+          }
+        }
+      ]
+    },
+    "lvmUuid": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9]{6}(-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "positiveDecimal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "allocation": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/anchorAllocation"
+        },
+        {
+          "$ref": "#/$defs/thinAllocation"
+        }
+      ]
+    },
+    "anchorAllocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "partuuid",
+        "policy"
+      ],
+      "properties": {
+        "partuuid": {
+          "$ref": "#/$defs/nonzeroUuid"
+        },
+        "policy": {
+          "const": "exact-anchor-pv-only"
+        }
+      }
+    },
+    "thinAllocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy",
+        "thin_pool"
+      ],
+      "properties": {
+        "policy": {
+          "const": "thin-only"
+        },
+        "thin_pool": {
+          "const": "pool"
+        }
+      }
+    },
+    "volume": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allocation",
+        "critical",
+        "kind",
+        "name",
+        "role",
+        "size_bytes",
+        "tags",
+        "virtual_bytes"
+      ],
+      "properties": {
+        "allocation": {
+          "$ref": "#/$defs/allocation"
+        },
+        "critical": {
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "thick",
+            "thin-metadata",
+            "thin-metadata-spare",
+            "thin-data",
+            "thin"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "size_bytes": {
+          "$ref": "#/$defs/decimal"
+        },
+        "tags": {
+          "type": "array",
+          "minItems": 0,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.+-]+$"
+          }
+        },
+        "virtual_bytes": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/positiveDecimal"
+            }
+          ]
+        }
+      }
+    },
+    "volumeGgmeta": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/volume"
+        },
+        {
+          "properties": {
+            "allocation": {
+              "$ref": "#/$defs/anchorAllocation"
+            },
+            "critical": {
+              "const": true
+            },
+            "kind": {
+              "const": "thick"
+            },
+            "name": {
+              "const": "ggmeta"
+            },
+            "role": {
+              "const": "transaction-metadata"
+            },
+            "size_bytes": {
+              "const": "536870912"
+            },
+            "tags": {
+              "const": [
+                "greygoo.critical",
+                "pocketboot.meta.v1"
+              ]
+            },
+            "virtual_bytes": {
+              "const": null
+            }
+          }
+        }
+      ]
+    },
+    "volumeBootRescue": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/volume"
+        },
+        {
+          "properties": {
+            "allocation": {
+              "$ref": "#/$defs/anchorAllocation"
+            },
+            "critical": {
+              "const": true
+            },
+            "kind": {
+              "const": "thick"
+            },
+            "name": {
+              "const": "boot-rescue"
+            },
+            "role": {
+              "const": "rescue-boot-filesystem"
+            },
+            "size_bytes": {
+              "const": "2147483648"
+            },
+            "tags": {
+              "const": [
+                "greygoo.critical",
+                "pocketboot.bootfs.v1"
+              ]
+            },
+            "virtual_bytes": {
+              "const": null
+            }
+          }
+        }
+      ]
+    },
+    "volumeHome": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/volume"
+        },
+        {
+          "properties": {
+            "allocation": {
+              "$ref": "#/$defs/anchorAllocation"
+            },
+            "critical": {
+              "const": true
+            },
+            "kind": {
+              "const": "thick"
+            },
+            "name": {
+              "const": "home"
+            },
+            "role": {
+              "const": "shared-homed-backing-store"
+            },
+            "size_bytes": {
+              "const": "8589934592"
+            },
+            "tags": {
+              "const": [
+                "frankensargo.home.v1",
+                "greygoo.critical"
+              ]
+            },
+            "virtual_bytes": {
+              "const": null
+            }
+          }
+        }
+      ]
+    },
+    "volumeHomedState": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/volume"
+        },
+        {
+          "properties": {
+            "allocation": {
+              "$ref": "#/$defs/anchorAllocation"
+            },
+            "critical": {
+              "const": true
+            },
+            "kind": {
+              "const": "thick"
+            },
+            "name": {
+              "const": "homed-state"
+            },
+            "role": {
+              "const": "shared-homed-records-and-keys"
+            },
+            "size_bytes": {
+              "const": "268435456"
+            },
+            "tags": {
+              "const": [
+                "frankensargo.homed-state.v1",
+                "greygoo.critical"
+              ]
+            },
+            "virtual_bytes": {
+              "const": null
+            }
+          }
+        }
+      ]
+    },
+    "volumePoolMeta": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/volume"
+        },
+        {
+          "properties": {
+            "allocation": {
+              "$ref": "#/$defs/anchorAllocation"
+            },
+            "critical": {
+              "const": true
+            },
+            "kind": {
+              "const": "thin-metadata"
+            },
+            "name": {
+              "const": "pool-meta"
+            },
+            "role": {
+              "const": "thin-pool-metadata"
+            },
+            "size_bytes": {
+              "const": "536870912"
+            },
+            "tags": {
+              "const": [
+                "greygoo.critical",
+                "greygoo.thin-metadata.v1"
+              ]
+            },
+            "virtual_bytes": {
+              "const": null
+            }
+          }
+        }
+      ]
+    },
+    "volumePmspare": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/volume"
+        },
+        {
+          "properties": {
+            "allocation": {
+              "$ref": "#/$defs/anchorAllocation"
+            },
+            "critical": {
+              "const": true
+            },
+            "kind": {
+              "const": "thin-metadata-spare"
+            },
+            "name": {
+              "const": "lvol0_pmspare"
+            },
+            "role": {
+              "const": "lvm-managed-thin-metadata-spare"
+            },
+            "size_bytes": {
+              "const": "536870912"
+            },
+            "tags": {
+              "const": []
+            },
+            "virtual_bytes": {
+              "const": null
+            }
+          }
+        }
+      ]
+    },
+    "volumePool": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/volume"
+        },
+        {
+          "properties": {
+            "allocation": {
+              "$ref": "#/$defs/anchorAllocation"
+            },
+            "critical": {
+              "const": false
+            },
+            "kind": {
+              "const": "thin-data"
+            },
+            "name": {
+              "const": "pool"
+            },
+            "role": {
+              "const": "thin-pool-data"
+            },
+            "size_bytes": {
+              "const": "21474836480"
+            },
+            "tags": {
+              "const": [
+                "greygoo.replaceable",
+                "greygoo.thin-pool.v1"
+              ]
+            },
+            "virtual_bytes": {
+              "const": null
+            }
+          }
+        }
+      ]
+    },
+    "volumeDuranium": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/volume"
+        },
+        {
+          "properties": {
+            "allocation": {
+              "$ref": "#/$defs/thinAllocation"
+            },
+            "critical": {
+              "const": false
+            },
+            "kind": {
+              "const": "thin"
+            },
+            "name": {
+              "const": "disk-duranium"
+            },
+            "role": {
+              "const": "duranium-whole-disk"
+            },
+            "size_bytes": {
+              "const": "0"
+            },
+            "tags": {
+              "const": [
+                "distro.duranium",
+                "greygoo.import-pending",
+                "greygoo.replaceable"
+              ]
+            },
+            "virtual_bytes": {
+              "const": "21474836480"
+            }
+          }
+        }
+      ]
+    },
+    "lvm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capacity",
+        "lv_uuid_policy",
+        "physical_extent_bytes",
+        "pv",
+        "thin_pool",
+        "vg_name",
+        "vg_tags",
+        "vg_uuid_policy",
+        "volumes"
+      ],
+      "properties": {
+        "vg_name": {
+          "const": "franken"
+        },
+        "physical_extent_bytes": {
+          "const": "4194304"
+        },
+        "pv": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "data_alignment_bytes",
+            "metadata_area_bytes_each",
+            "metadata_copies",
+            "planned_uuid",
+            "tags",
+            "uuid_policy"
+          ],
+          "properties": {
+            "planned_uuid": {
+              "$ref": "#/$defs/lvmUuid"
+            },
+            "uuid_policy": {
+              "const": "operator-generated-random-and-frozen-before-first-write"
+            },
+            "metadata_copies": {
+              "const": 2
+            },
+            "metadata_area_bytes_each": {
+              "const": "16777216"
+            },
+            "data_alignment_bytes": {
+              "const": "1048576"
+            },
+            "tags": {
+              "const": [
+                "greygoo.anchor",
+                "pocketboot.pv.v1"
+              ]
+            }
+          }
+        },
+        "vg_uuid_policy": {
+          "const": "lvm-generated-capture-and-fsync-before-next-mutation"
+        },
+        "lv_uuid_policy": {
+          "const": "lvm-generated-capture-and-fsync-after-each-create"
+        },
+        "vg_tags": {
+          "const": [
+            "pocketboot.vg.v1"
+          ]
+        },
+        "thin_pool": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "automatic_metadata_spare",
+            "chunk_bytes",
+            "discard_policy",
+            "error_when_full",
+            "managed_spare_lv",
+            "name"
+          ],
+          "properties": {
+            "name": {
+              "const": "pool"
+            },
+            "chunk_bytes": {
+              "const": "262144"
+            },
+            "error_when_full": {
+              "const": true
+            },
+            "discard_policy": {
+              "const": "nopassdown"
+            },
+            "automatic_metadata_spare": {
+              "const": true
+            },
+            "managed_spare_lv": {
+              "const": "lvol0_pmspare"
+            }
+          }
+        },
+        "volumes": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/volumeGgmeta"
+            },
+            {
+              "$ref": "#/$defs/volumeBootRescue"
+            },
+            {
+              "$ref": "#/$defs/volumeHome"
+            },
+            {
+              "$ref": "#/$defs/volumeHomedState"
+            },
+            {
+              "$ref": "#/$defs/volumePoolMeta"
+            },
+            {
+              "$ref": "#/$defs/volumePmspare"
+            },
+            {
+              "$ref": "#/$defs/volumePool"
+            },
+            {
+              "$ref": "#/$defs/volumeDuranium"
+            }
+          ],
+          "items": false
+        },
+        "capacity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "duranium_virtual_bytes",
+            "conservative_extent_capacity_after_budget_bytes",
+            "extent_rounding_tail_bytes",
+            "mandatory_recovery_reserve_bytes",
+            "partition_bytes",
+            "planned_free_extents_after_allocations_bytes",
+            "planned_physical_lv_bytes",
+            "pv_metadata_alignment_budget_bytes",
+            "uncommitted_slack_beyond_reserve_bytes"
+          ],
+          "properties": {
+            "partition_bytes": {
+              "const": "53648801280"
+            },
+            "pv_metadata_alignment_budget_bytes": {
+              "const": "67108864"
+            },
+            "conservative_extent_capacity_after_budget_bytes": {
+              "const": "53578039296"
+            },
+            "extent_rounding_tail_bytes": {
+              "const": "3653120"
+            },
+            "planned_physical_lv_bytes": {
+              "const": "34091302912"
+            },
+            "planned_free_extents_after_allocations_bytes": {
+              "const": "19486736384"
+            },
+            "mandatory_recovery_reserve_bytes": {
+              "const": "17179869184"
+            },
+            "uncommitted_slack_beyond_reserve_bytes": {
+              "const": "2306867200"
+            },
+            "duranium_virtual_bytes": {
+              "const": "21474836480"
+            }
+          }
+        }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "argv",
+        "checkpoint",
+        "destructive",
+        "step"
+      ],
+      "properties": {
+        "argv": {
+          "$ref": "#/$defs/argv"
+        },
+        "checkpoint": {
+          "$ref": "#/$defs/checkpoint"
+        },
+        "destructive": {
+          "type": "boolean"
+        },
+        "step": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capture_fields",
+        "expected_after",
+        "expected_before",
+        "fsync_before_next_step",
+        "ordinal",
+        "remote_capture",
+        "resume_policy",
+        "state_file",
+        "vgcfgbackup_argv"
+      ],
+      "properties": {
+        "capture_fields": {
+          "$ref": "#/$defs/nonemptyUniqueStrings"
+        },
+        "expected_after": {
+          "$ref": "#/$defs/nonemptyUniqueStrings"
+        },
+        "expected_before": {
+          "$ref": "#/$defs/nonemptyUniqueStrings"
+        },
+        "fsync_before_next_step": {
+          "const": true
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 13
+        },
+        "remote_capture": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/remoteCapture"
+            }
+          ]
+        },
+        "resume_policy": {
+          "const": "accept-exact-postcondition-else-require-exact-precondition"
+        },
+        "state_file": {
+          "type": "string",
+          "pattern": "^@HOST_DURABLE_STATE_DIR@/steps/(0[1-9]|1[0-3])-[a-z0-9-]+[.]json$"
+        },
+        "vgcfgbackup_argv": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/argv"
+            }
+          ]
+        }
+      }
+    },
+    "remoteCapture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hash",
+        "host_destination",
+        "pull_hash_and_fsync_before_next_step",
+        "source"
+      ],
+      "properties": {
+        "hash": {
+          "const": "sha256"
+        },
+        "host_destination": {
+          "type": "string",
+          "pattern": "^@HOST_DURABLE_STATE_DIR@/.+"
+        },
+        "pull_hash_and_fsync_before_next_step": {
+          "const": true
+        },
+        "source": {
+          "type": "string",
+          "pattern": "^@POCKETBOOT_VOLATILE_STATE_DIR@/.+"
+        }
+      }
+    },
+    "nonemptyUniqueStrings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "commandCreatePv": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "type": "array",
+              "minItems": 22,
+              "maxItems": 22,
+              "prefixItems": [
+                {
+                  "const": "/sbin/lvm.static"
+                },
+                {
+                  "const": "pvcreate"
+                },
+                {
+                  "const": "--devices"
+                },
+                {
+                  "const": "@USERDATA_BLOCK_DEVICE@"
+                },
+                {
+                  "const": "--nohints"
+                },
+                {
+                  "const": "--config"
+                },
+                {
+                  "const": "backup/backup=0 backup/archive=0"
+                },
+                {
+                  "const": "--yes"
+                },
+                {
+                  "const": "--force"
+                },
+                {
+                  "const": "--force"
+                },
+                {
+                  "const": "--uuid"
+                },
+                {
+                  "$ref": "#/$defs/lvmUuid"
+                },
+                {
+                  "const": "--norestorefile"
+                },
+                {
+                  "const": "--zero"
+                },
+                {
+                  "const": "y"
+                },
+                {
+                  "const": "--dataalignment"
+                },
+                {
+                  "const": "1m"
+                },
+                {
+                  "const": "--metadatasize"
+                },
+                {
+                  "const": "16m"
+                },
+                {
+                  "const": "--pvmetadatacopies"
+                },
+                {
+                  "const": "2"
+                },
+                {
+                  "const": "@USERDATA_BLOCK_DEVICE@"
+                }
+              ],
+              "items": false
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 1
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/01-create-anchor-pv.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "bound-partition-has-no-lvm-signature",
+                        "franken-vg-is-absent"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "bound-partition-is-exact-planned-pv"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "pv_uuid",
+                        "pv_name",
+                        "pv_size",
+                        "pv_free",
+                        "pv_tags"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": null
+                    },
+                    "remote_capture": {
+                      "const": null
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": true
+            },
+            "step": {
+              "const": "create-anchor-pv"
+            }
+          }
+        }
+      ]
+    },
+    "commandCreateVg": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "const": [
+                "/sbin/lvm.static",
+                "vgcreate",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--yes",
+                "--physicalextentsize",
+                "4m",
+                "--setautoactivation",
+                "n",
+                "--addtag",
+                "pocketboot.vg.v1",
+                "franken",
+                "@USERDATA_BLOCK_DEVICE@"
+              ]
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 2
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/02-create-anchor-vg.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "planned-pv-exists-unassigned",
+                        "franken-vg-is-absent"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "franken-vg-exists-on-exact-planned-pv"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "pv_uuid",
+                        "vg_uuid",
+                        "vg_name",
+                        "vg_extent_size",
+                        "vg_tags"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": [
+                        "/sbin/lvm.static",
+                        "vgcfgbackup",
+                        "--devices",
+                        "@USERDATA_BLOCK_DEVICE@",
+                        "--nohints",
+                        "--config",
+                        "backup/backup=0 backup/archive=0",
+                        "--readonly",
+                        "--file",
+                        "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/02-create-anchor-vg.vgcfg",
+                        "franken"
+                      ]
+                    },
+                    "remote_capture": {
+                      "const": {
+                        "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/02-create-anchor-vg.vgcfg",
+                        "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/02-create-anchor-vg.vgcfg",
+                        "hash": "sha256",
+                        "pull_hash_and_fsync_before_next_step": true
+                      }
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": true
+            },
+            "step": {
+              "const": "create-anchor-vg"
+            }
+          }
+        }
+      ]
+    },
+    "commandTagPv": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "const": [
+                "/sbin/lvm.static",
+                "pvchange",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--yes",
+                "--addtag",
+                "greygoo.anchor",
+                "--addtag",
+                "pocketboot.pv.v1",
+                "@USERDATA_BLOCK_DEVICE@"
+              ]
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 3
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/03-tag-anchor-pv.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "franken-vg-and-planned-pv-match-checkpoints"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "planned-pv-has-exact-anchor-tags"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "pv_uuid",
+                        "pv_name",
+                        "pv_tags",
+                        "vg_uuid"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": [
+                        "/sbin/lvm.static",
+                        "vgcfgbackup",
+                        "--devices",
+                        "@USERDATA_BLOCK_DEVICE@",
+                        "--nohints",
+                        "--config",
+                        "backup/backup=0 backup/archive=0",
+                        "--readonly",
+                        "--file",
+                        "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/03-tag-anchor-pv.vgcfg",
+                        "franken"
+                      ]
+                    },
+                    "remote_capture": {
+                      "const": {
+                        "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/03-tag-anchor-pv.vgcfg",
+                        "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/03-tag-anchor-pv.vgcfg",
+                        "hash": "sha256",
+                        "pull_hash_and_fsync_before_next_step": true
+                      }
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": true
+            },
+            "step": {
+              "const": "tag-anchor-pv"
+            }
+          }
+        }
+      ]
+    },
+    "commandCreateGgmeta": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "const": [
+                "/sbin/lvm.static",
+                "lvcreate",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--yes",
+                "--activate",
+                "n",
+                "--permission",
+                "rw",
+                "--wipesignatures",
+                "n",
+                "--zero",
+                "n",
+                "--contiguous",
+                "y",
+                "--size",
+                "512m",
+                "--name",
+                "ggmeta",
+                "--addtag",
+                "greygoo.critical",
+                "--addtag",
+                "pocketboot.meta.v1",
+                "franken",
+                "@USERDATA_BLOCK_DEVICE@"
+              ]
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 4
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/04-create-ggmeta.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "franken-vg-and-planned-pv-match-checkpoints",
+                        "ggmeta-lv-is-absent"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "ggmeta-lv-has-exact-size-tags-and-anchor-placement"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "lv_uuid",
+                        "lv_name",
+                        "lv_size",
+                        "lv_tags",
+                        "lv_attr",
+                        "segtype",
+                        "devices",
+                        "vg_uuid"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": [
+                        "/sbin/lvm.static",
+                        "vgcfgbackup",
+                        "--devices",
+                        "@USERDATA_BLOCK_DEVICE@",
+                        "--nohints",
+                        "--config",
+                        "backup/backup=0 backup/archive=0",
+                        "--readonly",
+                        "--file",
+                        "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/04-create-ggmeta.vgcfg",
+                        "franken"
+                      ]
+                    },
+                    "remote_capture": {
+                      "const": {
+                        "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/04-create-ggmeta.vgcfg",
+                        "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/04-create-ggmeta.vgcfg",
+                        "hash": "sha256",
+                        "pull_hash_and_fsync_before_next_step": true
+                      }
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": true
+            },
+            "step": {
+              "const": "create-ggmeta"
+            }
+          }
+        }
+      ]
+    },
+    "commandCreateBootRescue": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "const": [
+                "/sbin/lvm.static",
+                "lvcreate",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--yes",
+                "--activate",
+                "n",
+                "--permission",
+                "rw",
+                "--wipesignatures",
+                "n",
+                "--zero",
+                "n",
+                "--contiguous",
+                "y",
+                "--size",
+                "2g",
+                "--name",
+                "boot-rescue",
+                "--addtag",
+                "greygoo.critical",
+                "--addtag",
+                "pocketboot.bootfs.v1",
+                "franken",
+                "@USERDATA_BLOCK_DEVICE@"
+              ]
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 5
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/05-create-boot-rescue.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "franken-vg-and-planned-pv-match-checkpoints",
+                        "boot-rescue-lv-is-absent"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "boot-rescue-lv-has-exact-size-tags-and-anchor-placement"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "lv_uuid",
+                        "lv_name",
+                        "lv_size",
+                        "lv_tags",
+                        "lv_attr",
+                        "segtype",
+                        "devices",
+                        "vg_uuid"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": [
+                        "/sbin/lvm.static",
+                        "vgcfgbackup",
+                        "--devices",
+                        "@USERDATA_BLOCK_DEVICE@",
+                        "--nohints",
+                        "--config",
+                        "backup/backup=0 backup/archive=0",
+                        "--readonly",
+                        "--file",
+                        "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/05-create-boot-rescue.vgcfg",
+                        "franken"
+                      ]
+                    },
+                    "remote_capture": {
+                      "const": {
+                        "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/05-create-boot-rescue.vgcfg",
+                        "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/05-create-boot-rescue.vgcfg",
+                        "hash": "sha256",
+                        "pull_hash_and_fsync_before_next_step": true
+                      }
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": true
+            },
+            "step": {
+              "const": "create-boot-rescue"
+            }
+          }
+        }
+      ]
+    },
+    "commandCreateHome": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "const": [
+                "/sbin/lvm.static",
+                "lvcreate",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--yes",
+                "--activate",
+                "n",
+                "--permission",
+                "rw",
+                "--wipesignatures",
+                "n",
+                "--zero",
+                "n",
+                "--contiguous",
+                "y",
+                "--size",
+                "8g",
+                "--name",
+                "home",
+                "--addtag",
+                "frankensargo.home.v1",
+                "--addtag",
+                "greygoo.critical",
+                "franken",
+                "@USERDATA_BLOCK_DEVICE@"
+              ]
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 6
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/06-create-home.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "franken-vg-and-planned-pv-match-checkpoints",
+                        "home-lv-is-absent"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "home-lv-has-exact-size-tags-and-anchor-placement"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "lv_uuid",
+                        "lv_name",
+                        "lv_size",
+                        "lv_tags",
+                        "lv_attr",
+                        "segtype",
+                        "devices",
+                        "vg_uuid"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": [
+                        "/sbin/lvm.static",
+                        "vgcfgbackup",
+                        "--devices",
+                        "@USERDATA_BLOCK_DEVICE@",
+                        "--nohints",
+                        "--config",
+                        "backup/backup=0 backup/archive=0",
+                        "--readonly",
+                        "--file",
+                        "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/06-create-home.vgcfg",
+                        "franken"
+                      ]
+                    },
+                    "remote_capture": {
+                      "const": {
+                        "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/06-create-home.vgcfg",
+                        "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/06-create-home.vgcfg",
+                        "hash": "sha256",
+                        "pull_hash_and_fsync_before_next_step": true
+                      }
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": true
+            },
+            "step": {
+              "const": "create-home"
+            }
+          }
+        }
+      ]
+    },
+    "commandCreateHomedState": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "const": [
+                "/sbin/lvm.static",
+                "lvcreate",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--yes",
+                "--activate",
+                "n",
+                "--permission",
+                "rw",
+                "--wipesignatures",
+                "n",
+                "--zero",
+                "n",
+                "--contiguous",
+                "y",
+                "--size",
+                "256m",
+                "--name",
+                "homed-state",
+                "--addtag",
+                "frankensargo.homed-state.v1",
+                "--addtag",
+                "greygoo.critical",
+                "franken",
+                "@USERDATA_BLOCK_DEVICE@"
+              ]
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 7
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/07-create-homed-state.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "franken-vg-and-planned-pv-match-checkpoints",
+                        "homed-state-lv-is-absent"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "homed-state-lv-has-exact-size-tags-and-anchor-placement"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "lv_uuid",
+                        "lv_name",
+                        "lv_size",
+                        "lv_tags",
+                        "lv_attr",
+                        "segtype",
+                        "devices",
+                        "vg_uuid"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": [
+                        "/sbin/lvm.static",
+                        "vgcfgbackup",
+                        "--devices",
+                        "@USERDATA_BLOCK_DEVICE@",
+                        "--nohints",
+                        "--config",
+                        "backup/backup=0 backup/archive=0",
+                        "--readonly",
+                        "--file",
+                        "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/07-create-homed-state.vgcfg",
+                        "franken"
+                      ]
+                    },
+                    "remote_capture": {
+                      "const": {
+                        "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/07-create-homed-state.vgcfg",
+                        "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/07-create-homed-state.vgcfg",
+                        "hash": "sha256",
+                        "pull_hash_and_fsync_before_next_step": true
+                      }
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": true
+            },
+            "step": {
+              "const": "create-homed-state"
+            }
+          }
+        }
+      ]
+    },
+    "commandCreatePoolMeta": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "const": [
+                "/sbin/lvm.static",
+                "lvcreate",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--yes",
+                "--activate",
+                "n",
+                "--permission",
+                "rw",
+                "--wipesignatures",
+                "n",
+                "--zero",
+                "n",
+                "--contiguous",
+                "y",
+                "--size",
+                "512m",
+                "--name",
+                "pool-meta",
+                "--addtag",
+                "greygoo.critical",
+                "--addtag",
+                "greygoo.thin-metadata.v1",
+                "franken",
+                "@USERDATA_BLOCK_DEVICE@"
+              ]
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 8
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/08-create-pool-meta.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "franken-vg-and-planned-pv-match-checkpoints",
+                        "pool-meta-lv-is-absent"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "pool-meta-lv-has-exact-size-tags-and-anchor-placement"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "lv_uuid",
+                        "lv_name",
+                        "lv_size",
+                        "lv_tags",
+                        "lv_attr",
+                        "segtype",
+                        "devices",
+                        "vg_uuid"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": [
+                        "/sbin/lvm.static",
+                        "vgcfgbackup",
+                        "--devices",
+                        "@USERDATA_BLOCK_DEVICE@",
+                        "--nohints",
+                        "--config",
+                        "backup/backup=0 backup/archive=0",
+                        "--readonly",
+                        "--file",
+                        "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/08-create-pool-meta.vgcfg",
+                        "franken"
+                      ]
+                    },
+                    "remote_capture": {
+                      "const": {
+                        "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/08-create-pool-meta.vgcfg",
+                        "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/08-create-pool-meta.vgcfg",
+                        "hash": "sha256",
+                        "pull_hash_and_fsync_before_next_step": true
+                      }
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": true
+            },
+            "step": {
+              "const": "create-pool-meta"
+            }
+          }
+        }
+      ]
+    },
+    "commandCreatePool": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "const": [
+                "/sbin/lvm.static",
+                "lvcreate",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--yes",
+                "--activate",
+                "n",
+                "--permission",
+                "rw",
+                "--wipesignatures",
+                "n",
+                "--zero",
+                "n",
+                "--contiguous",
+                "y",
+                "--size",
+                "20g",
+                "--name",
+                "pool",
+                "--addtag",
+                "greygoo.replaceable",
+                "--addtag",
+                "greygoo.thin-pool.v1",
+                "franken",
+                "@USERDATA_BLOCK_DEVICE@"
+              ]
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 9
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/09-create-pool.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "franken-vg-and-planned-pv-match-checkpoints",
+                        "pool-lv-is-absent"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "pool-lv-has-exact-size-tags-and-anchor-placement"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "lv_uuid",
+                        "lv_name",
+                        "lv_size",
+                        "lv_tags",
+                        "lv_attr",
+                        "segtype",
+                        "devices",
+                        "vg_uuid"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": [
+                        "/sbin/lvm.static",
+                        "vgcfgbackup",
+                        "--devices",
+                        "@USERDATA_BLOCK_DEVICE@",
+                        "--nohints",
+                        "--config",
+                        "backup/backup=0 backup/archive=0",
+                        "--readonly",
+                        "--file",
+                        "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/09-create-pool.vgcfg",
+                        "franken"
+                      ]
+                    },
+                    "remote_capture": {
+                      "const": {
+                        "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/09-create-pool.vgcfg",
+                        "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/09-create-pool.vgcfg",
+                        "hash": "sha256",
+                        "pull_hash_and_fsync_before_next_step": true
+                      }
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": true
+            },
+            "step": {
+              "const": "create-pool"
+            }
+          }
+        }
+      ]
+    },
+    "commandConvertThinPool": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "const": [
+                "/sbin/lvm.static",
+                "lvconvert",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--yes",
+                "--type",
+                "thin-pool",
+                "--chunksize",
+                "256k",
+                "--poolmetadata",
+                "franken/pool-meta",
+                "--poolmetadataspare",
+                "y",
+                "--discards",
+                "nopassdown",
+                "--errorwhenfull",
+                "y",
+                "franken/pool",
+                "@USERDATA_BLOCK_DEVICE@"
+              ]
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 10
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/10-convert-thin-pool.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "pool-and-pool-meta-match-checkpoints",
+                        "thin-pool-and-pmspare-are-absent"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "pool-is-exact-thin-pool",
+                        "pool-tmeta-and-lvol0-pmspare-are-anchor-pinned"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "pool_lv_uuid",
+                        "pool_tdata_lv_uuid",
+                        "pool_tmeta_lv_uuid",
+                        "pmspare_lv_uuid",
+                        "lv_size",
+                        "lv_tags",
+                        "lv_attr",
+                        "segtype",
+                        "devices",
+                        "vg_uuid"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": [
+                        "/sbin/lvm.static",
+                        "vgcfgbackup",
+                        "--devices",
+                        "@USERDATA_BLOCK_DEVICE@",
+                        "--nohints",
+                        "--config",
+                        "backup/backup=0 backup/archive=0",
+                        "--readonly",
+                        "--file",
+                        "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/10-convert-thin-pool.vgcfg",
+                        "franken"
+                      ]
+                    },
+                    "remote_capture": {
+                      "const": {
+                        "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/10-convert-thin-pool.vgcfg",
+                        "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/10-convert-thin-pool.vgcfg",
+                        "hash": "sha256",
+                        "pull_hash_and_fsync_before_next_step": true
+                      }
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": true
+            },
+            "step": {
+              "const": "convert-thin-pool"
+            }
+          }
+        }
+      ]
+    },
+    "commandCreateDuranium": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "const": [
+                "/sbin/lvm.static",
+                "lvcreate",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--yes",
+                "--activate",
+                "n",
+                "--permission",
+                "rw",
+                "--zero",
+                "n",
+                "--type",
+                "thin",
+                "--thinpool",
+                "pool",
+                "--virtualsize",
+                "20g",
+                "--name",
+                "disk-duranium",
+                "--addtag",
+                "distro.duranium",
+                "--addtag",
+                "greygoo.import-pending",
+                "--addtag",
+                "greygoo.replaceable",
+                "franken"
+              ]
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 11
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/11-create-duranium-thin-disk.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "pool-thin-layout-matches-checkpoint",
+                        "disk-duranium-lv-is-absent"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "disk-duranium-is-exact-import-pending-thin-lv"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "lv_uuid",
+                        "lv_name",
+                        "lv_size",
+                        "lv_tags",
+                        "lv_attr",
+                        "segtype",
+                        "pool_lv_uuid",
+                        "vg_uuid"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": [
+                        "/sbin/lvm.static",
+                        "vgcfgbackup",
+                        "--devices",
+                        "@USERDATA_BLOCK_DEVICE@",
+                        "--nohints",
+                        "--config",
+                        "backup/backup=0 backup/archive=0",
+                        "--readonly",
+                        "--file",
+                        "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/11-create-duranium-thin-disk.vgcfg",
+                        "franken"
+                      ]
+                    },
+                    "remote_capture": {
+                      "const": {
+                        "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/11-create-duranium-thin-disk.vgcfg",
+                        "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/11-create-duranium-thin-disk.vgcfg",
+                        "hash": "sha256",
+                        "pull_hash_and_fsync_before_next_step": true
+                      }
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": true
+            },
+            "step": {
+              "const": "create-duranium-thin-disk"
+            }
+          }
+        }
+      ]
+    },
+    "commandBackupVg": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/command"
+        },
+        {
+          "properties": {
+            "argv": {
+              "const": [
+                "/sbin/lvm.static",
+                "vgcfgbackup",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--readonly",
+                "--file",
+                "@POCKETBOOT_VOLATILE_STATE_DIR@/franken.vgcfg",
+                "franken"
+              ]
+            },
+            "checkpoint": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/checkpoint"
+                },
+                {
+                  "properties": {
+                    "ordinal": {
+                      "const": 12
+                    },
+                    "state_file": {
+                      "const": "@HOST_DURABLE_STATE_DIR@/steps/12-backup-vg-metadata.json"
+                    },
+                    "resume_policy": {
+                      "const": "accept-exact-postcondition-else-require-exact-precondition"
+                    },
+                    "expected_before": {
+                      "const": [
+                        "complete-lvm-layout-matches-all-checkpoints"
+                      ]
+                    },
+                    "expected_after": {
+                      "const": [
+                        "durable-vgcfgbackup-matches-live-vg-metadata"
+                      ]
+                    },
+                    "capture_fields": {
+                      "const": [
+                        "vg_uuid",
+                        "vgcfgbackup_sha256"
+                      ]
+                    },
+                    "vgcfgbackup_argv": {
+                      "const": null
+                    },
+                    "remote_capture": {
+                      "const": {
+                        "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/franken.vgcfg",
+                        "host_destination": "@HOST_DURABLE_STATE_DIR@/franken.vgcfg",
+                        "hash": "sha256",
+                        "pull_hash_and_fsync_before_next_step": true
+                      }
+                    },
+                    "fsync_before_next_step": {
+                      "const": true
+                    }
+                  }
+                }
+              ]
+            },
+            "destructive": {
+              "const": false
+            },
+            "step": {
+              "const": "backup-vg-metadata"
+            }
+          }
+        }
+      ]
+    },
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "transaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command_argv",
+        "device_placeholder",
+        "execution_policy",
+        "host_state_directory_placeholder",
+        "lvm_binary",
+        "placement_assertions",
+        "post_import_argv",
+        "preconditions",
+        "recovery_gate",
+        "pocketboot_volatile_state_directory_placeholder",
+        "runtime_attestation_policy",
+        "runtime_artifacts",
+        "verification_argv"
+      ],
+      "properties": {
+        "lvm_binary": {
+          "const": "/sbin/lvm.static"
+        },
+        "device_placeholder": {
+          "const": "@USERDATA_BLOCK_DEVICE@"
+        },
+        "host_state_directory_placeholder": {
+          "const": "@HOST_DURABLE_STATE_DIR@"
+        },
+        "pocketboot_volatile_state_directory_placeholder": {
+          "const": "@POCKETBOOT_VOLATILE_STATE_DIR@"
+        },
+        "execution_policy": {
+          "const": "one-command-then-verify-and-fsync-checkpoint-never-blind-replay"
+        },
+        "recovery_gate": {
+          "const": "manual-out-of-band-operator-attestation-required"
+        },
+        "runtime_attestation_policy": {
+          "const": "pull-and-match-exact-runtime-files-and-lvm-version-before-first-write"
+        },
+        "runtime_artifacts": {
+          "const": {
+            "lvm_static": {
+              "path": "/sbin/lvm.static",
+              "version": "2.03.35",
+              "bytes": "2309032",
+              "sha256": "sha256:b83d704df60ca281deb56f1704d74db731a05365e90d0162556b2c355b572d39"
+            },
+            "lvm_conf": {
+              "path": "/etc/lvm/lvm.conf",
+              "bytes": "432",
+              "sha256": "sha256:16eb1787836608cfaff40aa904705b2138928010b1b4011e4ab981b4d43e2998"
+            }
+          }
+        },
+        "preconditions": {
+          "const": [
+            "resolve-device-placeholder-by-exact-sysfs-partuuid-scan-and-recheck-all-bound-identity",
+            "rehash-complete-live-source-with-pbread1-oem-hash-and-match-current-full-source-sha256",
+            "pull-and-hash-runtime-files-and-match-lvm-version-before-first-write",
+            "persist-and-fsync-bootstrap-intent-before-first-command",
+            "record-manual-stock-fastboot-and-sysrq-recovery-attestation-before-first-command",
+            "require-explicit-confirmation-token-in-a-separate-executor"
+          ]
+        },
+        "command_argv": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/commandCreatePv"
+            },
+            {
+              "$ref": "#/$defs/commandCreateVg"
+            },
+            {
+              "$ref": "#/$defs/commandTagPv"
+            },
+            {
+              "$ref": "#/$defs/commandCreateGgmeta"
+            },
+            {
+              "$ref": "#/$defs/commandCreateBootRescue"
+            },
+            {
+              "$ref": "#/$defs/commandCreateHome"
+            },
+            {
+              "$ref": "#/$defs/commandCreateHomedState"
+            },
+            {
+              "$ref": "#/$defs/commandCreatePoolMeta"
+            },
+            {
+              "$ref": "#/$defs/commandCreatePool"
+            },
+            {
+              "$ref": "#/$defs/commandConvertThinPool"
+            },
+            {
+              "$ref": "#/$defs/commandCreateDuranium"
+            },
+            {
+              "$ref": "#/$defs/commandBackupVg"
+            }
+          ],
+          "items": false
+        },
+        "post_import_argv": {
+          "const": [
+            {
+              "step": "publish-verified-duranium-disk",
+              "argv": [
+                "/sbin/lvm.static",
+                "lvchange",
+                "--devices",
+                "@USERDATA_BLOCK_DEVICE@",
+                "--nohints",
+                "--config",
+                "backup/backup=0 backup/archive=0",
+                "--permission",
+                "r",
+                "--deltag",
+                "greygoo.import-pending",
+                "--addtag",
+                "pocketboot.disk.v1",
+                "franken/disk-duranium"
+              ],
+              "checkpoint": {
+                "ordinal": 13,
+                "state_file": "@HOST_DURABLE_STATE_DIR@/steps/13-publish-verified-duranium-disk.json",
+                "resume_policy": "accept-exact-postcondition-else-require-exact-precondition",
+                "expected_before": [
+                  "disk-duranium-import-is-complete-and-readback-hash-verified",
+                  "disk-duranium-is-exact-import-pending-thin-lv"
+                ],
+                "expected_after": [
+                  "disk-duranium-is-read-only-published-pocketboot-disk"
+                ],
+                "capture_fields": [
+                  "lv_uuid",
+                  "lv_name",
+                  "lv_tags",
+                  "lv_attr",
+                  "pool_lv_uuid",
+                  "vg_uuid"
+                ],
+                "vgcfgbackup_argv": [
+                  "/sbin/lvm.static",
+                  "vgcfgbackup",
+                  "--devices",
+                  "@USERDATA_BLOCK_DEVICE@",
+                  "--nohints",
+                  "--config",
+                  "backup/backup=0 backup/archive=0",
+                  "--readonly",
+                  "--file",
+                  "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/13-publish-verified-duranium-disk.vgcfg",
+                  "franken"
+                ],
+                "remote_capture": {
+                  "source": "@POCKETBOOT_VOLATILE_STATE_DIR@/steps/13-publish-verified-duranium-disk.vgcfg",
+                  "host_destination": "@HOST_DURABLE_STATE_DIR@/vgcfg/13-publish-verified-duranium-disk.vgcfg",
+                  "hash": "sha256",
+                  "pull_hash_and_fsync_before_next_step": true
+                },
+                "fsync_before_next_step": true
+              }
+            }
+          ]
+        },
+        "verification_argv": {
+          "const": [
+            [
+              "/sbin/lvm.static",
+              "pvs",
+              "--devices",
+              "@USERDATA_BLOCK_DEVICE@",
+              "--nohints",
+              "--config",
+              "backup/backup=0 backup/archive=0",
+              "--readonly",
+              "--nolocking",
+              "--reportformat",
+              "json_std",
+              "--units",
+              "b",
+              "--nosuffix",
+              "-o",
+              "pv_uuid,pv_name,dev_size,pv_size,pv_free,pe_start,pv_mda_size,pv_mda_free,pv_mda_count,pv_mda_used_count,pv_pe_count,pv_pe_alloc_count,pv_tags,vg_uuid,vg_name",
+              "@USERDATA_BLOCK_DEVICE@"
+            ],
+            [
+              "/sbin/lvm.static",
+              "vgs",
+              "--devices",
+              "@USERDATA_BLOCK_DEVICE@",
+              "--nohints",
+              "--config",
+              "backup/backup=0 backup/archive=0",
+              "--readonly",
+              "--nolocking",
+              "--reportformat",
+              "json_std",
+              "-o",
+              "vg_uuid,vg_name,vg_size,vg_free,vg_extent_size,vg_extent_count,vg_free_count,pv_count,lv_count,vg_missing_pv_count,vg_mda_count,vg_mda_used_count,vg_autoactivation,vg_tags",
+              "franken"
+            ],
+            [
+              "/sbin/lvm.static",
+              "lvs",
+              "--devices",
+              "@USERDATA_BLOCK_DEVICE@",
+              "--nohints",
+              "--config",
+              "backup/backup=0 backup/archive=0",
+              "--readonly",
+              "--nolocking",
+              "--reportformat",
+              "json_std",
+              "--units",
+              "b",
+              "--nosuffix",
+              "--segments",
+              "-a",
+              "-o",
+              "vg_uuid,lv_uuid,lv_name,lv_size,lv_active,lv_permissions,segtype,seg_start_pe,seg_size_pe,devices,metadata_devices,data_lv_uuid,metadata_lv_uuid,pool_lv_uuid,lv_tags,lv_attr,chunk_size",
+              "franken"
+            ]
+          ]
+        },
+        "placement_assertions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "all_physical_extents_userdata_only",
+            "allowed_physical_partuuids",
+            "automatic_allocation_from_future_pvs",
+            "critical_extents_userdata_pinned",
+            "thin_metadata_and_spare_userdata_pinned"
+          ],
+          "properties": {
+            "allowed_physical_partuuids": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "items": {
+                "$ref": "#/$defs/nonzeroUuid"
+              }
+            },
+            "all_physical_extents_userdata_only": {
+              "const": true
+            },
+            "critical_extents_userdata_pinned": {
+              "const": true
+            },
+            "thin_metadata_and_spare_userdata_pinned": {
+              "const": true
+            },
+            "automatic_allocation_from_future_pvs": {
+              "const": false
+            }
+          }
+        }
+      }
+    }
+  }
+}
