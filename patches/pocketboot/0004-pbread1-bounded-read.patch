@@ -1,0 +1,1354 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 0de8e2648bd0f7bc41ce61638867b643a8a40b9d..3cb4dfd7cfdcbe0324142d5ff7bea72a1ba25178 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3488,6 +3488,7 @@ dependencies = [
+  "ruzstd",
+  "serde",
+  "serde_json",
++ "sha2",
+  "slint",
+  "slint-build",
+  "tracing",
+diff --git a/Cargo.toml b/Cargo.toml
+index d34753dcacfcdf8ee1c59c4fdc18db9453b099bf..6447f2d9d46b9a17a05842a31bf92a0597598ded 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,6 +24,7 @@ ruzstd = "0.8.3"
+ rustix = { version = "1", features = ["termios"] }
+ serde = { version = "1", features = ["derive"], optional = true }
+ serde_json = { version = "1", optional = true }
++sha2 = "0.10.9"
+ slint = { version = "1.16.1", default-features = false, features = ["compat-1-2", "libm", "renderer-software", "unsafe-single-threaded"] }
+ tracing = "0.1"
+ tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
+diff --git a/src/fastboot/commands/mod.rs b/src/fastboot/commands/mod.rs
+index 1f81f3359d8fc028c3124d38b0d909714a8fdcea..6341a9d0afb0a5bc0d225c7e866d8c9a162b7edb 100644
+--- a/src/fastboot/commands/mod.rs
++++ b/src/fastboot/commands/mod.rs
+@@ -6,6 +6,7 @@ mod dmesg;
+ mod flash;
+ mod getvar;
+ mod partitions;
++mod pbread1;
+ mod reboot;
+ mod shell;
+ mod slots;
+@@ -23,6 +24,8 @@ pub(crate) fn diagnostic_commands() -> CommandMap {
+     vec![
+         Command::prefix("oem cat:", cat::handle),
+         Command::exact("oem dmesg", dmesg::handle),
++        Command::prefix("oem hash ", pbread1::handle_hash),
++        Command::prefix("oem read ", pbread1::handle_read),
+         Command::prefix("oem shell:", shell::handle),
+         Command::exact("oem shell-staged", shell::handle_staged),
+     ]
+diff --git a/src/fastboot/commands/pbread1.rs b/src/fastboot/commands/pbread1.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b737065ee657d6272f0aec950e23b67190d0e3b
+--- /dev/null
++++ b/src/fastboot/commands/pbread1.rs
+@@ -0,0 +1,1303 @@
++use std::{
++    fs::{self, File},
++    io::{self, Read, Seek, SeekFrom, Write},
++    os::{
++        fd::AsRawFd,
++        unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt},
++    },
++    path::{Path, PathBuf},
++    time::{Duration, Instant},
++};
++
++use sha2::{Digest, Sha256};
++
++use crate::{
++    fastboot::{CommandContext, CommandResult},
++    kexec,
++};
++
++const READ_COMMAND_PREFIX: &str = "oem read ";
++const HASH_COMMAND_PREFIX: &str = "oem hash ";
++const HEADER_BYTES: usize = 512;
++const FLAG_PAYLOAD: u32 = 1;
++const FLAG_HASH_ONLY: u32 = 2;
++const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
++const COPY_BYTES: usize = 1024 * 1024;
++const HASH_PROGRESS_BYTES: u64 = 256 * 1024 * 1024;
++const HASH_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
++const BLKGETSIZE64: libc::Ioctl = 0x8008_1272;
++const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
++const GPT_HEADER_MIN_BYTES: usize = 92;
++const GPT_ENTRY_MIN_BYTES: usize = 128;
++
++pub(super) fn handle_read(
++    context: &mut CommandContext<'_>,
++    command: &str,
++) -> io::Result<CommandResult> {
++    let request = parse_read_command(command)?;
++    let paths = SystemPaths::live();
++    let (identity, mut source) = prepare_source(&paths, &request.partuuid32)?;
++    validate_range(&identity, request.offset, request.length)?;
++
++    let staged_size = (HEADER_BYTES as u64)
++        .checked_add(request.length)
++        .ok_or_else(|| invalid_input("PBREAD1 staged size overflows"))?;
++    let mut staged = kexec::create_payload_memfd("pbread1-range")?;
++    staged.set_len(staged_size)?;
++    staged.write_all(&[0; HEADER_BYTES])?;
++    source.seek(SeekFrom::Start(request.offset))?;
++
++    let digest = copy_and_hash(&mut source, &mut staged, request.length)?;
++    revalidate_source(&paths, &identity, &source)?;
++
++    let header = Header::range(&identity, request.offset, request.length, digest).encode()?;
++    staged.seek(SeekFrom::Start(0))?;
++    staged.write_all(&header)?;
++    staged.seek(SeekFrom::Start(0))?;
++
++    // Do not replace a prior stage until every read, hash, identity and
++    // quiescence check has succeeded.
++    context.stage_file("pbread1-range", staged, staged_size);
++    context.info(format!(
++        "PBREAD1 staged {} bytes from {} at 0x{:x}",
++        request.length, identity.kernel_name, request.offset
++    ))?;
++    context.info(b"run fastboot get_staged <host-file>")?;
++    context.okay(b"")?;
++    Ok(CommandResult::continue_())
++}
++
++pub(super) fn handle_hash(
++    context: &mut CommandContext<'_>,
++    command: &str,
++) -> io::Result<CommandResult> {
++    let partuuid32 = parse_hash_command(command)?;
++    let paths = SystemPaths::live();
++    let (identity, mut source) = prepare_source(&paths, &partuuid32)?;
++
++    context.info(format!(
++        "PBREAD1 hashing {} bytes from {}",
++        identity.partition_bytes, identity.kernel_name
++    ))?;
++    let digest = hash_whole_source(context, &mut source, identity.partition_bytes)?;
++    revalidate_source(&paths, &identity, &source)?;
++
++    let header = Header::hash(&identity, digest).encode()?;
++    // As with bounded reads, preserve any earlier stage on every failure.
++    context.stage("pbread1-hash", header.to_vec());
++    context.info(format!(
++        "PBREAD1 hash complete for {} bytes",
++        identity.partition_bytes
++    ))?;
++    context.info(b"run fastboot get_staged <host-file>")?;
++    context.okay(b"")?;
++    Ok(CommandResult::continue_())
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct ReadRequest {
++    partuuid32: String,
++    offset: u64,
++    length: u64,
++}
++
++fn parse_read_command(command: &str) -> io::Result<ReadRequest> {
++    let arguments = command
++        .strip_prefix(READ_COMMAND_PREFIX)
++        .ok_or_else(|| invalid_input("invalid PBREAD1 read command"))?;
++    let words = arguments.split_whitespace().collect::<Vec<_>>();
++    let [partuuid32, offset, length] = words.as_slice() else {
++        return Err(invalid_input(
++            "usage: oem read <partuuid32> <offset_hex> <length_hex>",
++        ));
++    };
++    validate_requested_partuuid(partuuid32)?;
++    Ok(ReadRequest {
++        partuuid32: (*partuuid32).to_string(),
++        offset: parse_hex_u64(offset, "offset")?,
++        length: parse_hex_u64(length, "length")?,
++    })
++}
++
++fn parse_hash_command(command: &str) -> io::Result<String> {
++    let arguments = command
++        .strip_prefix(HASH_COMMAND_PREFIX)
++        .ok_or_else(|| invalid_input("invalid PBREAD1 hash command"))?;
++    let words = arguments.split_whitespace().collect::<Vec<_>>();
++    let [partuuid32] = words.as_slice() else {
++        return Err(invalid_input("usage: oem hash <partuuid32>"));
++    };
++    validate_requested_partuuid(partuuid32)?;
++    Ok((*partuuid32).to_string())
++}
++
++fn validate_requested_partuuid(value: &str) -> io::Result<()> {
++    if value.len() != 32
++        || !value
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++    {
++        return Err(invalid_input(
++            "PARTUUID must be exactly 32 lowercase hexadecimal digits",
++        ));
++    }
++    if value.bytes().all(|byte| byte == b'0') {
++        return Err(invalid_input("PARTUUID must not be zero"));
++    }
++    Ok(())
++}
++
++fn parse_hex_u64(value: &str, field: &str) -> io::Result<u64> {
++    if value.is_empty()
++        || value.len() > 16
++        || !value
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++    {
++        return Err(invalid_input(format!(
++            "PBREAD1 {field} must be lowercase hexadecimal without 0x"
++        )));
++    }
++    u64::from_str_radix(value, 16)
++        .map_err(|_| invalid_input(format!("PBREAD1 {field} does not fit u64")))
++}
++
++fn validate_range(identity: &PartitionIdentity, offset: u64, length: u64) -> io::Result<()> {
++    let sector = u64::from(identity.logical_sector_bytes);
++    if length == 0 {
++        return Err(invalid_input("PBREAD1 length must be nonzero"));
++    }
++    if length > MAX_READ_BYTES {
++        return Err(invalid_input(format!(
++            "PBREAD1 length exceeds 64 MiB: {length}"
++        )));
++    }
++    if !offset.is_multiple_of(sector) || !length.is_multiple_of(sector) {
++        return Err(invalid_input(format!(
++            "PBREAD1 range must be aligned to {sector} bytes"
++        )));
++    }
++    let end = offset
++        .checked_add(length)
++        .ok_or_else(|| invalid_input("PBREAD1 range overflows"))?;
++    if end > identity.partition_bytes {
++        return Err(invalid_input(format!(
++            "PBREAD1 range ends at {end}, beyond {}",
++            identity.partition_bytes
++        )));
++    }
++    Ok(())
++}
++
++fn copy_and_hash(source: &mut File, output: &mut File, mut remaining: u64) -> io::Result<[u8; 32]> {
++    let mut digest = Sha256::new();
++    let mut buffer = vec![0; COPY_BYTES];
++    while remaining > 0 {
++        let length = usize::try_from(remaining.min(buffer.len() as u64))
++            .map_err(|_| invalid_input("PBREAD1 read chunk does not fit usize"))?;
++        source.read_exact(&mut buffer[..length])?;
++        output.write_all(&buffer[..length])?;
++        digest.update(&buffer[..length]);
++        remaining -= length as u64;
++    }
++    Ok(digest.finalize().into())
++}
++
++fn hash_whole_source(
++    context: &mut CommandContext<'_>,
++    source: &mut File,
++    total: u64,
++) -> io::Result<[u8; 32]> {
++    source.seek(SeekFrom::Start(0))?;
++    let mut digest = Sha256::new();
++    let mut buffer = vec![0; COPY_BYTES];
++    let mut completed = 0u64;
++    let mut next_bytes = HASH_PROGRESS_BYTES;
++    let mut last_report = Instant::now();
++
++    while completed < total {
++        let length = usize::try_from((total - completed).min(buffer.len() as u64))
++            .map_err(|_| invalid_input("PBREAD1 hash chunk does not fit usize"))?;
++        source.read_exact(&mut buffer[..length])?;
++        digest.update(&buffer[..length]);
++        completed += length as u64;
++
++        if completed >= next_bytes || last_report.elapsed() >= HASH_PROGRESS_INTERVAL {
++            context.info(format!("PBREAD1 hash progress {completed}/{total}"))?;
++            next_bytes = completed.saturating_add(HASH_PROGRESS_BYTES);
++            last_report = Instant::now();
++        }
++    }
++    Ok(digest.finalize().into())
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++struct PartitionIdentity {
++    partuuid32: String,
++    parttype32: String,
++    partlabel: String,
++    kernel_name: String,
++    start_lba: u64,
++    sectors: u64,
++    logical_sector_bytes: u32,
++    partition_bytes: u64,
++    devnum: Devnum,
++    dev_path: PathBuf,
++    sysfs_path: PathBuf,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++struct Devnum {
++    major: u32,
++    minor: u32,
++}
++
++impl Devnum {
++    fn parse(value: &str) -> io::Result<Self> {
++        let (major, minor) = value
++            .trim()
++            .split_once(':')
++            .ok_or_else(|| invalid_data(format!("invalid device number {value:?}")))?;
++        Ok(Self {
++            major: major
++                .parse()
++                .map_err(|err| invalid_data(format!("invalid device major: {err}")))?,
++            minor: minor
++                .parse()
++                .map_err(|err| invalid_data(format!("invalid device minor: {err}")))?,
++        })
++    }
++
++    fn from_rdev(rdev: u64) -> Self {
++        Self {
++            major: libc::major(rdev) as u32,
++            minor: libc::minor(rdev) as u32,
++        }
++    }
++
++    fn text(self) -> String {
++        format!("{}:{}", self.major, self.minor)
++    }
++}
++
++#[derive(Clone, Debug)]
++struct SystemPaths {
++    sys_block: PathBuf,
++    dev_root: PathBuf,
++    mountinfo: PathBuf,
++    swaps: PathBuf,
++    usb_gadgets: PathBuf,
++}
++
++impl SystemPaths {
++    fn live() -> Self {
++        Self {
++            sys_block: PathBuf::from("/sys/block"),
++            dev_root: PathBuf::from("/dev"),
++            mountinfo: PathBuf::from("/proc/self/mountinfo"),
++            swaps: PathBuf::from("/proc/swaps"),
++            usb_gadgets: PathBuf::from("/sys/kernel/config/usb_gadget"),
++        }
++    }
++}
++
++fn prepare_source(paths: &SystemPaths, partuuid32: &str) -> io::Result<(PartitionIdentity, File)> {
++    let identity = resolve_partuuid(paths, partuuid32)?;
++    ensure_quiescent(paths, &identity)?;
++    let source = open_source(&identity)?;
++    revalidate_source(paths, &identity, &source)?;
++    Ok((identity, source))
++}
++
++fn revalidate_source(
++    paths: &SystemPaths,
++    expected: &PartitionIdentity,
++    source: &File,
++) -> io::Result<()> {
++    let observed = resolve_partuuid(paths, &expected.partuuid32)?;
++    if &observed != expected {
++        return Err(invalid_data("PBREAD1 partition identity changed"));
++    }
++    validate_open_source(expected, source)?;
++    ensure_quiescent(paths, expected)
++}
++
++fn resolve_partuuid(paths: &SystemPaths, requested: &str) -> io::Result<PartitionIdentity> {
++    validate_requested_partuuid(requested)?;
++    let mut matches = Vec::new();
++
++    for disk_entry in fs::read_dir(&paths.sys_block)? {
++        let disk_entry = disk_entry?;
++        let disk_path = disk_entry.path();
++        let disk_name = disk_entry.file_name().to_string_lossy().into_owned();
++        if !disk_path.is_dir() {
++            continue;
++        }
++        for partition_entry in fs::read_dir(&disk_path)? {
++            let partition_entry = partition_entry?;
++            let sysfs_path = partition_entry.path();
++            if !sysfs_path.join("partition").exists() {
++                continue;
++            }
++            let Some(raw_partuuid) = uevent_value(sysfs_path.join("uevent"), "PARTUUID") else {
++                continue;
++            };
++            if normalize_uuid32(&raw_partuuid).as_deref() == Some(requested) {
++                matches.push((
++                    disk_name.clone(),
++                    disk_path.clone(),
++                    partition_entry.file_name().to_string_lossy().into_owned(),
++                    sysfs_path,
++                ));
++            }
++        }
++    }
++
++    let [(disk_name, disk_path, kernel_name, sysfs_path)] = matches.as_slice() else {
++        return Err(match matches.len() {
++            0 => io::Error::new(
++                io::ErrorKind::NotFound,
++                format!("PBREAD1 PARTUUID {requested} was not found"),
++            ),
++            count => invalid_input(format!(
++                "PBREAD1 PARTUUID {requested} is ambiguous across {count} partitions"
++            )),
++        });
++    };
++    resolve_identity(
++        paths,
++        requested,
++        disk_name,
++        disk_path,
++        kernel_name,
++        sysfs_path,
++    )
++}
++
++fn resolve_identity(
++    paths: &SystemPaths,
++    requested: &str,
++    disk_name: &str,
++    disk_path: &Path,
++    kernel_name: &str,
++    sysfs_path: &Path,
++) -> io::Result<PartitionIdentity> {
++    let logical_sector_bytes = read_decimal_u32(disk_path.join("queue/logical_block_size"))?;
++    if logical_sector_bytes != 512 {
++        return Err(invalid_data(format!(
++            "PBREAD1 requires 512-byte logical sectors, found {logical_sector_bytes}"
++        )));
++    }
++    let partition_number = read_decimal_u32(sysfs_path.join("partition"))?;
++    if partition_number == 0 {
++        return Err(invalid_data("GPT partition number is zero"));
++    }
++    let start_lba = read_decimal_u64(sysfs_path.join("start"))?;
++    let sectors = read_decimal_u64(sysfs_path.join("size"))?;
++    if sectors == 0 {
++        return Err(invalid_data("PBREAD1 partition has zero sectors"));
++    }
++    let partition_bytes = sectors
++        .checked_mul(u64::from(logical_sector_bytes))
++        .ok_or_else(|| invalid_data("PBREAD1 partition byte size overflows"))?;
++    let devnum = Devnum::parse(&fs::read_to_string(sysfs_path.join("dev"))?)?;
++    let uevent = fs::read_to_string(sysfs_path.join("uevent"))?;
++    let uevent_partname = value_from_uevent(&uevent, "PARTNAME")
++        .ok_or_else(|| invalid_data("PBREAD1 partition has no PARTNAME"))?;
++
++    let disk_device = paths.dev_root.join(disk_name);
++    let entry = read_gpt_entry(&disk_device, logical_sector_bytes, partition_number)?;
++    if entry.partuuid32 != requested {
++        return Err(invalid_data(format!(
++            "GPT PARTUUID {} does not match requested {requested}",
++            entry.partuuid32
++        )));
++    }
++    if entry.start_lba != start_lba || entry.sectors != sectors {
++        return Err(invalid_data("GPT and sysfs partition geometry disagree"));
++    }
++    if entry.partlabel != uevent_partname {
++        return Err(invalid_data(format!(
++            "GPT label {:?} does not match PARTNAME {:?}",
++            entry.partlabel, uevent_partname
++        )));
++    }
++
++    let dev_path = paths.dev_root.join(kernel_name);
++    if !dev_path.exists() {
++        return Err(io::Error::new(
++            io::ErrorKind::NotFound,
++            format!("PBREAD1 device node {} is missing", dev_path.display()),
++        ));
++    }
++    Ok(PartitionIdentity {
++        partuuid32: requested.to_string(),
++        parttype32: entry.parttype32,
++        partlabel: entry.partlabel,
++        kernel_name: kernel_name.to_string(),
++        start_lba,
++        sectors,
++        logical_sector_bytes,
++        partition_bytes,
++        devnum,
++        dev_path,
++        sysfs_path: sysfs_path.to_path_buf(),
++    })
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct GptEntry {
++    parttype32: String,
++    partuuid32: String,
++    partlabel: String,
++    start_lba: u64,
++    sectors: u64,
++}
++
++fn read_gpt_entry(
++    disk_path: &Path,
++    logical_sector_bytes: u32,
++    partition_number: u32,
++) -> io::Result<GptEntry> {
++    let disk = File::options()
++        .read(true)
++        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
++        .open(disk_path)
++        .map_err(|err| {
++            io::Error::new(err.kind(), format!("open {}: {err}", disk_path.display()))
++        })?;
++    let sector = u64::from(logical_sector_bytes);
++    let mut header = vec![0; logical_sector_bytes as usize];
++    read_exact_at(&disk, &mut header, sector)?;
++    if header.get(..8) != Some(GPT_SIGNATURE.as_slice()) {
++        return Err(invalid_data("primary GPT signature is missing"));
++    }
++    let header_size = read_le_u32(&header, 12)? as usize;
++    if !(GPT_HEADER_MIN_BYTES..=header.len()).contains(&header_size) {
++        return Err(invalid_data(format!(
++            "invalid GPT header size {header_size}"
++        )));
++    }
++    let entries_lba = read_le_u64(&header, 72)?;
++    let entry_count = read_le_u32(&header, 80)?;
++    let entry_bytes = read_le_u32(&header, 84)?;
++    if partition_number > entry_count || entry_bytes < GPT_ENTRY_MIN_BYTES as u32 {
++        return Err(invalid_data(
++            "GPT partition entry is outside the entry array",
++        ));
++    }
++    let index = u64::from(partition_number - 1);
++    let entry_offset = entries_lba
++        .checked_mul(sector)
++        .and_then(|offset| offset.checked_add(index.checked_mul(u64::from(entry_bytes))?))
++        .ok_or_else(|| invalid_data("GPT entry offset overflows"))?;
++    let mut entry = [0; GPT_ENTRY_MIN_BYTES];
++    read_exact_at(&disk, &mut entry, entry_offset)?;
++
++    let parttype32 = guid32_from_gpt(&entry[0..16])?;
++    if parttype32.bytes().all(|byte| byte == b'0') {
++        return Err(invalid_data("GPT partition type GUID is zero"));
++    }
++    let partuuid32 = guid32_from_gpt(&entry[16..32])?;
++    if partuuid32.bytes().all(|byte| byte == b'0') {
++        return Err(invalid_data("GPT partition UUID is zero"));
++    }
++    let start_lba = read_le_u64(&entry, 32)?;
++    let last_lba = read_le_u64(&entry, 40)?;
++    let sectors = last_lba
++        .checked_sub(start_lba)
++        .and_then(|delta| delta.checked_add(1))
++        .ok_or_else(|| invalid_data("GPT partition LBA range is invalid"))?;
++    let partlabel = decode_gpt_label(&entry[56..128])?;
++
++    Ok(GptEntry {
++        parttype32,
++        partuuid32,
++        partlabel,
++        start_lba,
++        sectors,
++    })
++}
++
++fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
++    while !buffer.is_empty() {
++        let read = file.read_at(buffer, offset)?;
++        if read == 0 {
++            return Err(io::Error::new(
++                io::ErrorKind::UnexpectedEof,
++                "GPT data is truncated",
++            ));
++        }
++        offset = offset
++            .checked_add(read as u64)
++            .ok_or_else(|| invalid_data("GPT read offset overflows"))?;
++        buffer = &mut buffer[read..];
++    }
++    Ok(())
++}
++
++fn guid32_from_gpt(raw: &[u8]) -> io::Result<String> {
++    let raw: &[u8; 16] = raw
++        .try_into()
++        .map_err(|_| invalid_data("GPT GUID is truncated"))?;
++    let ordered = [
++        raw[3], raw[2], raw[1], raw[0], raw[5], raw[4], raw[7], raw[6], raw[8], raw[9], raw[10],
++        raw[11], raw[12], raw[13], raw[14], raw[15],
++    ];
++    let mut output = String::with_capacity(32);
++    for byte in ordered {
++        use std::fmt::Write as _;
++        write!(&mut output, "{byte:02x}").unwrap();
++    }
++    Ok(output)
++}
++
++fn decode_gpt_label(raw: &[u8]) -> io::Result<String> {
++    if !raw.len().is_multiple_of(2) {
++        return Err(invalid_data("GPT label is truncated"));
++    }
++    let mut units = Vec::new();
++    let mut ended = false;
++    for pair in raw.chunks_exact(2) {
++        let unit = u16::from_le_bytes([pair[0], pair[1]]);
++        if unit == 0 {
++            ended = true;
++            continue;
++        }
++        if ended {
++            return Err(invalid_data("GPT label has nonzero data after NUL"));
++        }
++        units.push(unit);
++    }
++    let label = String::from_utf16(&units)
++        .map_err(|err| invalid_data(format!("GPT label is invalid UTF-16: {err}")))?;
++    if label.is_empty() || !label.is_ascii() || label.as_bytes().contains(&0) || label.len() > 63 {
++        return Err(invalid_data(
++            "GPT label must contain 1..63 non-NUL ASCII bytes",
++        ));
++    }
++    Ok(label)
++}
++
++fn normalize_uuid32(value: &str) -> Option<String> {
++    let value = value.trim().as_bytes();
++    if value.len() != 32 && value.len() != 36 {
++        return None;
++    }
++    let mut normalized = String::with_capacity(32);
++    for (index, byte) in value.iter().copied().enumerate() {
++        if value.len() == 36 && matches!(index, 8 | 13 | 18 | 23) {
++            if byte != b'-' {
++                return None;
++            }
++            continue;
++        }
++        if !byte.is_ascii_hexdigit() {
++            return None;
++        }
++        normalized.push((byte as char).to_ascii_lowercase());
++    }
++    (normalized.len() == 32).then_some(normalized)
++}
++
++fn open_source(identity: &PartitionIdentity) -> io::Result<File> {
++    let source = File::options()
++        .read(true)
++        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
++        .open(&identity.dev_path)
++        .map_err(|err| {
++            io::Error::new(
++                err.kind(),
++                format!("open {} read-only: {err}", identity.dev_path.display()),
++            )
++        })?;
++    validate_open_source(identity, &source)?;
++    Ok(source)
++}
++
++fn validate_open_source(identity: &PartitionIdentity, source: &File) -> io::Result<()> {
++    let flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) };
++    if flags < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    if flags & libc::O_ACCMODE != libc::O_RDONLY {
++        return Err(io::Error::new(
++            io::ErrorKind::PermissionDenied,
++            "PBREAD1 source is not open read-only",
++        ));
++    }
++    let metadata = source.metadata()?;
++    let observation = SourceObservation {
++        block_device: metadata.file_type().is_block_device(),
++        devnum: Devnum::from_rdev(metadata.rdev()),
++        size_bytes: block_device_size(source)?,
++    };
++    validate_source_observation(identity, observation)
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++struct SourceObservation {
++    block_device: bool,
++    devnum: Devnum,
++    size_bytes: u64,
++}
++
++fn validate_source_observation(
++    identity: &PartitionIdentity,
++    observation: SourceObservation,
++) -> io::Result<()> {
++    if !observation.block_device {
++        return Err(invalid_data("PBREAD1 source is not a block device"));
++    }
++    if observation.devnum != identity.devnum {
++        return Err(invalid_data(format!(
++            "PBREAD1 source device number changed: expected {}, found {}",
++            identity.devnum.text(),
++            observation.devnum.text()
++        )));
++    }
++    if observation.size_bytes != identity.partition_bytes {
++        return Err(invalid_data(format!(
++            "PBREAD1 BLKGETSIZE64 mismatch: expected {}, found {}",
++            identity.partition_bytes, observation.size_bytes
++        )));
++    }
++    Ok(())
++}
++
++fn block_device_size(source: &File) -> io::Result<u64> {
++    let mut size = 0u64;
++    let result = unsafe { libc::ioctl(source.as_raw_fd(), BLKGETSIZE64, &mut size) };
++    if result < 0 {
++        Err(io::Error::last_os_error())
++    } else {
++        Ok(size)
++    }
++}
++
++fn ensure_quiescent(paths: &SystemPaths, identity: &PartitionIdentity) -> io::Result<()> {
++    ensure_not_mounted(paths, identity)?;
++    ensure_not_swap(paths, identity)?;
++    ensure_no_holders(identity)?;
++    ensure_no_active_ums(paths)
++}
++
++fn ensure_not_mounted(paths: &SystemPaths, identity: &PartitionIdentity) -> io::Result<()> {
++    let mountinfo = fs::read_to_string(&paths.mountinfo)?;
++    let devnum = identity.devnum.text();
++    if mountinfo
++        .lines()
++        .any(|line| line.split_whitespace().nth(2) == Some(devnum.as_str()))
++    {
++        return Err(busy(format!(
++            "PBREAD1 source {} is mounted",
++            identity.kernel_name
++        )));
++    }
++    Ok(())
++}
++
++fn ensure_not_swap(paths: &SystemPaths, identity: &PartitionIdentity) -> io::Result<()> {
++    let swaps = match fs::read_to_string(&paths.swaps) {
++        Ok(swaps) => swaps,
++        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
++        Err(err) => return Err(err),
++    };
++    for line in swaps.lines().skip(1) {
++        let Some(source) = line.split_whitespace().next() else {
++            continue;
++        };
++        if source == identity.dev_path.to_string_lossy() {
++            return Err(busy(format!(
++                "PBREAD1 source {} is active swap",
++                identity.kernel_name
++            )));
++        }
++        let metadata = fs::metadata(source).map_err(|err| {
++            io::Error::new(err.kind(), format!("stat active swap {source}: {err}"))
++        })?;
++        if metadata.file_type().is_block_device()
++            && Devnum::from_rdev(metadata.rdev()) == identity.devnum
++        {
++            return Err(busy(format!(
++                "PBREAD1 source {} is active swap",
++                identity.kernel_name
++            )));
++        }
++    }
++    Ok(())
++}
++
++fn ensure_no_holders(identity: &PartitionIdentity) -> io::Result<()> {
++    let holders = identity.sysfs_path.join("holders");
++    if fs::read_dir(&holders)?.next().transpose()?.is_some() {
++        return Err(busy(format!(
++            "PBREAD1 source {} has block holders",
++            identity.kernel_name
++        )));
++    }
++    Ok(())
++}
++
++fn ensure_no_active_ums(paths: &SystemPaths) -> io::Result<()> {
++    let gadgets = match fs::read_dir(&paths.usb_gadgets) {
++        Ok(gadgets) => gadgets,
++        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
++        Err(err) => return Err(err),
++    };
++    for gadget in gadgets {
++        let functions = gadget?.path().join("functions");
++        let functions = match fs::read_dir(functions) {
++            Ok(functions) => functions,
++            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
++            Err(err) => return Err(err),
++        };
++        for function in functions {
++            let function = function?;
++            if !function
++                .file_name()
++                .to_string_lossy()
++                .starts_with("mass_storage.")
++            {
++                continue;
++            }
++            for lun in fs::read_dir(function.path())? {
++                let lun = lun?;
++                if !lun.file_name().to_string_lossy().starts_with("lun.") {
++                    continue;
++                }
++                let file = lun.path().join("file");
++                let backing = match fs::read_to_string(&file) {
++                    Ok(value) => value.trim().to_string(),
++                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
++                    Err(err) => return Err(err),
++                };
++                if backing.is_empty() {
++                    continue;
++                }
++                return Err(busy(format!(
++                    "PBREAD1 requires every UMS LUN to be empty; found {backing:?}"
++                )));
++            }
++        }
++    }
++    Ok(())
++}
++
++#[derive(Debug)]
++struct Header<'a> {
++    flags: u32,
++    identity: &'a PartitionIdentity,
++    source_offset: u64,
++    source_length: u64,
++    payload_bytes: u64,
++    digest: [u8; 32],
++}
++
++impl<'a> Header<'a> {
++    fn range(
++        identity: &'a PartitionIdentity,
++        source_offset: u64,
++        source_length: u64,
++        digest: [u8; 32],
++    ) -> Self {
++        Self {
++            flags: FLAG_PAYLOAD,
++            identity,
++            source_offset,
++            source_length,
++            payload_bytes: source_length,
++            digest,
++        }
++    }
++
++    fn hash(identity: &'a PartitionIdentity, digest: [u8; 32]) -> Self {
++        Self {
++            flags: FLAG_HASH_ONLY,
++            identity,
++            source_offset: 0,
++            source_length: identity.partition_bytes,
++            payload_bytes: 0,
++            digest,
++        }
++    }
++
++    fn encode(&self) -> io::Result<[u8; HEADER_BYTES]> {
++        let mut output = [0u8; HEADER_BYTES];
++        output[0..8].copy_from_slice(b"PBREAD1\0");
++        put_u32(&mut output, 0x008, HEADER_BYTES as u32);
++        put_u32(&mut output, 0x00c, self.flags);
++        copy_exact_ascii(
++            &mut output[0x010..0x030],
++            &self.identity.partuuid32,
++            "PARTUUID",
++        )?;
++        copy_exact_ascii(
++            &mut output[0x030..0x050],
++            &self.identity.parttype32,
++            "type GUID",
++        )?;
++        put_u64(&mut output, 0x050, self.identity.start_lba);
++        put_u64(&mut output, 0x058, self.identity.sectors);
++        put_u32(&mut output, 0x060, self.identity.logical_sector_bytes);
++        put_u64(&mut output, 0x068, self.identity.partition_bytes);
++        put_u64(&mut output, 0x070, self.source_offset);
++        put_u64(&mut output, 0x078, self.source_length);
++        put_u64(&mut output, 0x080, self.payload_bytes);
++        output[0x088..0x0a8].copy_from_slice(&self.digest);
++        copy_nul_ascii(
++            &mut output[0x0a8..0x0e8],
++            &self.identity.partlabel,
++            "partition label",
++        )?;
++        copy_nul_ascii(
++            &mut output[0x0e8..0x108],
++            &self.identity.kernel_name,
++            "kernel name",
++        )?;
++        Ok(output)
++    }
++}
++
++fn copy_exact_ascii(output: &mut [u8], value: &str, field: &str) -> io::Result<()> {
++    if value.len() != output.len() || !value.is_ascii() || value.as_bytes().contains(&0) {
++        return Err(invalid_data(format!(
++            "PBREAD1 {field} must be exactly {} ASCII bytes",
++            output.len()
++        )));
++    }
++    output.copy_from_slice(value.as_bytes());
++    Ok(())
++}
++
++fn copy_nul_ascii(output: &mut [u8], value: &str, field: &str) -> io::Result<()> {
++    if value.is_empty()
++        || value.len() >= output.len()
++        || !value.is_ascii()
++        || value.as_bytes().contains(&0)
++    {
++        return Err(invalid_data(format!(
++            "PBREAD1 {field} must contain 1..{} non-NUL ASCII bytes",
++            output.len() - 1
++        )));
++    }
++    output[..value.len()].copy_from_slice(value.as_bytes());
++    Ok(())
++}
++
++fn put_u32(output: &mut [u8], offset: usize, value: u32) {
++    output[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
++}
++
++fn put_u64(output: &mut [u8], offset: usize, value: u64) {
++    output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
++}
++
++fn read_le_u32(input: &[u8], offset: usize) -> io::Result<u32> {
++    let bytes = input
++        .get(offset..offset + 4)
++        .ok_or_else(|| invalid_data("little-endian u32 is truncated"))?;
++    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
++}
++
++fn read_le_u64(input: &[u8], offset: usize) -> io::Result<u64> {
++    let bytes = input
++        .get(offset..offset + 8)
++        .ok_or_else(|| invalid_data("little-endian u64 is truncated"))?;
++    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
++}
++
++fn read_decimal_u32(path: impl AsRef<Path>) -> io::Result<u32> {
++    let path = path.as_ref();
++    fs::read_to_string(path)?
++        .trim()
++        .parse()
++        .map_err(|err| invalid_data(format!("{} is not a decimal u32: {err}", path.display())))
++}
++
++fn read_decimal_u64(path: impl AsRef<Path>) -> io::Result<u64> {
++    let path = path.as_ref();
++    fs::read_to_string(path)?
++        .trim()
++        .parse()
++        .map_err(|err| invalid_data(format!("{} is not a decimal u64: {err}", path.display())))
++}
++
++fn uevent_value(path: impl AsRef<Path>, key: &str) -> Option<String> {
++    value_from_uevent(&fs::read_to_string(path).ok()?, key).map(str::to_string)
++}
++
++fn value_from_uevent<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
++    contents.lines().find_map(|line| {
++        let (line_key, value) = line.split_once('=')?;
++        (line_key == key).then_some(value)
++    })
++}
++
++fn busy(message: impl Into<String>) -> io::Error {
++    io::Error::new(io::ErrorKind::ResourceBusy, message.into())
++}
++
++fn invalid_input(message: impl Into<String>) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidInput, message.into())
++}
++
++fn invalid_data(message: impl Into<String>) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, message.into())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::{SystemTime, UNIX_EPOCH};
++
++    const PARTUUID: &str = "db04e71311c34d68bec28cc483bd3891";
++    const PARTTYPE: &str = "1b81e7e6f50d419ba7392aeef8da3335";
++    const START_LBA: u64 = 100;
++    const SECTORS: u64 = 20;
++
++    #[test]
++    fn parses_exact_read_and_hash_commands() {
++        assert_eq!(
++            parse_read_command(&format!("oem read {PARTUUID} 200 400")).unwrap(),
++            ReadRequest {
++                partuuid32: PARTUUID.to_string(),
++                offset: 0x200,
++                length: 0x400,
++            }
++        );
++        assert_eq!(
++            parse_hash_command(&format!("oem hash {PARTUUID}")).unwrap(),
++            PARTUUID
++        );
++    }
++
++    #[test]
++    fn rejects_inexact_commands_and_identifiers() {
++        for command in [
++            format!("oem read {PARTUUID} 0"),
++            format!("oem read {} 0 200", PARTUUID.to_uppercase()),
++            format!("oem read {PARTUUID} 0x0 200"),
++            format!("oem read {PARTUUID} 0 200 extra"),
++        ] {
++            assert!(
++                parse_read_command(&command).is_err(),
++                "accepted {command:?}"
++            );
++        }
++        assert!(parse_hash_command(&format!("oem hash {PARTUUID} extra")).is_err());
++        assert!(normalize_uuid32("db04e713-11c3-4d68-bec2-8cc483bd3891").is_some());
++        assert!(normalize_uuid32("db04-e71311c3-4d68-bec2-8cc483bd3891").is_none());
++    }
++
++    #[test]
++    fn validates_bounded_aligned_ranges() {
++        let mut identity = sample_identity(Path::new("/tmp"));
++        assert!(validate_range(&identity, 0, 512).is_ok());
++        assert!(validate_range(&identity, 0, 0).is_err());
++        assert!(validate_range(&identity, 1, 512).is_err());
++        assert!(validate_range(&identity, 0, 513).is_err());
++        assert!(validate_range(&identity, 0, MAX_READ_BYTES + 512).is_err());
++        assert!(validate_range(&identity, identity.partition_bytes, 512).is_err());
++
++        identity.partition_bytes = u64::MAX;
++        assert!(validate_range(&identity, u64::MAX - 511, 512).is_err());
++    }
++
++    #[test]
++    fn encodes_exact_range_and_hash_envelopes() {
++        let identity = sample_identity(Path::new("/tmp"));
++        let digest = [0xab; 32];
++        let range = Header::range(&identity, 512, 1024, digest)
++            .encode()
++            .unwrap();
++
++        assert_eq!(&range[0..8], b"PBREAD1\0");
++        assert_eq!(read_le_u32(&range, 0x008).unwrap(), 512);
++        assert_eq!(read_le_u32(&range, 0x00c).unwrap(), FLAG_PAYLOAD);
++        assert_eq!(&range[0x010..0x030], PARTUUID.as_bytes());
++        assert_eq!(&range[0x030..0x050], PARTTYPE.as_bytes());
++        assert_eq!(read_le_u64(&range, 0x050).unwrap(), START_LBA);
++        assert_eq!(read_le_u64(&range, 0x058).unwrap(), SECTORS);
++        assert_eq!(read_le_u32(&range, 0x060).unwrap(), 512);
++        assert_eq!(read_le_u32(&range, 0x064).unwrap(), 0);
++        assert_eq!(read_le_u64(&range, 0x068).unwrap(), SECTORS * 512);
++        assert_eq!(read_le_u64(&range, 0x070).unwrap(), 512);
++        assert_eq!(read_le_u64(&range, 0x078).unwrap(), 1024);
++        assert_eq!(read_le_u64(&range, 0x080).unwrap(), 1024);
++        assert_eq!(&range[0x088..0x0a8], &digest);
++        assert_eq!(&range[0x0a8..0x0b1], b"userdata\0");
++        assert!(range[0x0b1..0x0e8].iter().all(|byte| *byte == 0));
++        assert_eq!(&range[0x0e8..0x0f3], b"mmcblk0p72\0");
++        assert!(range[0x0f3..].iter().all(|byte| *byte == 0));
++
++        let hash = Header::hash(&identity, digest).encode().unwrap();
++        assert_eq!(read_le_u32(&hash, 0x00c).unwrap(), FLAG_HASH_ONLY);
++        assert_eq!(read_le_u64(&hash, 0x070).unwrap(), 0);
++        assert_eq!(read_le_u64(&hash, 0x078).unwrap(), identity.partition_bytes);
++        assert_eq!(read_le_u64(&hash, 0x080).unwrap(), 0);
++    }
++
++    #[test]
++    fn resolves_one_exact_full_partuuid_and_gpt_identity() {
++        let tree = TempTree::new();
++        tree.add_partition("mmcblk0", "mmcblk0p72", 72, PARTUUID, "179:72");
++
++        let identity = resolve_partuuid(&tree.paths, PARTUUID).unwrap();
++
++        assert_eq!(identity.partuuid32, PARTUUID);
++        assert_eq!(identity.parttype32, PARTTYPE);
++        assert_eq!(identity.partlabel, "userdata");
++        assert_eq!(identity.kernel_name, "mmcblk0p72");
++        assert_eq!(identity.start_lba, START_LBA);
++        assert_eq!(identity.sectors, SECTORS);
++        assert_eq!(
++            identity.devnum,
++            Devnum {
++                major: 179,
++                minor: 72
++            }
++        );
++        assert!(resolve_partuuid(&tree.paths, "db04e71311c34d68bec28cc483bd3890").is_err());
++    }
++
++    #[test]
++    fn rejects_ambiguous_full_partuuid_matches() {
++        let tree = TempTree::new();
++        tree.add_partition("mmcblk0", "mmcblk0p72", 72, PARTUUID, "179:72");
++        tree.add_partition("mmcblk1", "mmcblk1p1", 1, PARTUUID, "179:73");
++
++        let error = resolve_partuuid(&tree.paths, PARTUUID).unwrap_err();
++
++        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
++        assert!(error.to_string().contains("ambiguous"));
++    }
++
++    #[test]
++    fn quiescence_gate_accepts_an_idle_partition() {
++        let tree = TempTree::new();
++        tree.add_partition("mmcblk0", "mmcblk0p72", 72, PARTUUID, "179:72");
++        let identity = resolve_partuuid(&tree.paths, PARTUUID).unwrap();
++
++        ensure_quiescent(&tree.paths, &identity).unwrap();
++    }
++
++    #[test]
++    fn quiescence_gate_rejects_mount_swap_holder_and_ums() {
++        for gate in ["mount", "swap", "holder", "ums"] {
++            let tree = TempTree::new();
++            tree.add_partition("mmcblk0", "mmcblk0p72", 72, PARTUUID, "179:72");
++            let identity = resolve_partuuid(&tree.paths, PARTUUID).unwrap();
++            match gate {
++                "mount" => fs::write(
++                    &tree.paths.mountinfo,
++                    "1 0 179:72 / / rw - ext4 /dev/mmcblk0p72 rw\n",
++                )
++                .unwrap(),
++                "swap" => fs::write(
++                    &tree.paths.swaps,
++                    format!(
++                        "Filename Type Size Used Priority\n{} partition 1 0 -2\n",
++                        identity.dev_path.display()
++                    ),
++                )
++                .unwrap(),
++                "holder" => fs::write(identity.sysfs_path.join("holders/dm-0"), "").unwrap(),
++                "ums" => {
++                    let lun = tree
++                        .paths
++                        .usb_gadgets
++                        .join("g1/functions/mass_storage.test/lun.0");
++                    fs::create_dir_all(&lun).unwrap();
++                    fs::write(
++                        lun.join("file"),
++                        identity.dev_path.as_os_str().as_encoded_bytes(),
++                    )
++                    .unwrap();
++                }
++                _ => unreachable!(),
++            }
++
++            let error = ensure_quiescent(&tree.paths, &identity).unwrap_err();
++            assert_eq!(error.kind(), io::ErrorKind::ResourceBusy, "gate {gate}");
++        }
++    }
++
++    #[test]
++    fn validates_open_block_identity_and_size_observation() {
++        let identity = sample_identity(Path::new("/tmp"));
++        let valid = SourceObservation {
++            block_device: true,
++            devnum: identity.devnum,
++            size_bytes: identity.partition_bytes,
++        };
++        validate_source_observation(&identity, valid).unwrap();
++
++        for invalid in [
++            SourceObservation {
++                block_device: false,
++                ..valid
++            },
++            SourceObservation {
++                devnum: Devnum {
++                    major: 179,
++                    minor: 71,
++                },
++                ..valid
++            },
++            SourceObservation {
++                size_bytes: identity.partition_bytes + 512,
++                ..valid
++            },
++        ] {
++            assert!(validate_source_observation(&identity, invalid).is_err());
++        }
++    }
++
++    fn sample_identity(root: &Path) -> PartitionIdentity {
++        PartitionIdentity {
++            partuuid32: PARTUUID.to_string(),
++            parttype32: PARTTYPE.to_string(),
++            partlabel: "userdata".to_string(),
++            kernel_name: "mmcblk0p72".to_string(),
++            start_lba: START_LBA,
++            sectors: SECTORS,
++            logical_sector_bytes: 512,
++            partition_bytes: SECTORS * 512,
++            devnum: Devnum {
++                major: 179,
++                minor: 72,
++            },
++            dev_path: root.join("dev/mmcblk0p72"),
++            sysfs_path: root.join("sys-block/mmcblk0/mmcblk0p72"),
++        }
++    }
++
++    struct TempTree {
++        root: PathBuf,
++        paths: SystemPaths,
++    }
++
++    impl TempTree {
++        fn new() -> Self {
++            let mut root = std::env::temp_dir();
++            let nonce = SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .unwrap()
++                .as_nanos();
++            root.push(format!(
++                "pocketboot-pbread1-test-{}-{nonce}",
++                std::process::id()
++            ));
++            let paths = SystemPaths {
++                sys_block: root.join("sys-block"),
++                dev_root: root.join("dev"),
++                mountinfo: root.join("proc/mountinfo"),
++                swaps: root.join("proc/swaps"),
++                usb_gadgets: root.join("config/usb_gadget"),
++            };
++            fs::create_dir_all(&paths.sys_block).unwrap();
++            fs::create_dir_all(&paths.dev_root).unwrap();
++            fs::create_dir_all(paths.mountinfo.parent().unwrap()).unwrap();
++            fs::create_dir_all(&paths.usb_gadgets).unwrap();
++            fs::write(&paths.mountinfo, "").unwrap();
++            fs::write(&paths.swaps, "Filename Type Size Used Priority\n").unwrap();
++            Self { root, paths }
++        }
++
++        fn add_partition(
++            &self,
++            disk: &str,
++            kernel_name: &str,
++            partition_number: u32,
++            partuuid32: &str,
++            devnum: &str,
++        ) {
++            let disk_sysfs = self.paths.sys_block.join(disk);
++            fs::create_dir_all(disk_sysfs.join("queue")).unwrap();
++            fs::write(disk_sysfs.join("queue/logical_block_size"), "512\n").unwrap();
++            let partition_sysfs = disk_sysfs.join(kernel_name);
++            fs::create_dir_all(partition_sysfs.join("holders")).unwrap();
++            fs::write(
++                partition_sysfs.join("partition"),
++                partition_number.to_string(),
++            )
++            .unwrap();
++            fs::write(partition_sysfs.join("start"), START_LBA.to_string()).unwrap();
++            fs::write(partition_sysfs.join("size"), SECTORS.to_string()).unwrap();
++            fs::write(partition_sysfs.join("dev"), devnum).unwrap();
++            fs::write(
++                partition_sysfs.join("uevent"),
++                format!("PARTNAME=userdata\nPARTUUID={}\n", hyphenated(partuuid32)),
++            )
++            .unwrap();
++            fs::write(self.paths.dev_root.join(kernel_name), "").unwrap();
++            write_gpt_disk(
++                &self.paths.dev_root.join(disk),
++                partition_number,
++                partuuid32,
++            );
++        }
++    }
++
++    impl Drop for TempTree {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.root);
++        }
++    }
++
++    fn write_gpt_disk(path: &Path, partition_number: u32, partuuid32: &str) {
++        let entry_offset = 2 * 512 + (partition_number as usize - 1) * GPT_ENTRY_MIN_BYTES;
++        let mut disk = vec![0u8; entry_offset + GPT_ENTRY_MIN_BYTES];
++        disk[512..520].copy_from_slice(GPT_SIGNATURE);
++        disk[512 + 12..512 + 16].copy_from_slice(&(GPT_HEADER_MIN_BYTES as u32).to_le_bytes());
++        disk[512 + 72..512 + 80].copy_from_slice(&2u64.to_le_bytes());
++        disk[512 + 80..512 + 84].copy_from_slice(&128u32.to_le_bytes());
++        disk[512 + 84..512 + 88].copy_from_slice(&(GPT_ENTRY_MIN_BYTES as u32).to_le_bytes());
++
++        let entry = &mut disk[entry_offset..entry_offset + GPT_ENTRY_MIN_BYTES];
++        entry[0..16].copy_from_slice(&guid_to_gpt(PARTTYPE));
++        entry[16..32].copy_from_slice(&guid_to_gpt(partuuid32));
++        entry[32..40].copy_from_slice(&START_LBA.to_le_bytes());
++        entry[40..48].copy_from_slice(&(START_LBA + SECTORS - 1).to_le_bytes());
++        for (index, unit) in "userdata".encode_utf16().enumerate() {
++            entry[56 + index * 2..58 + index * 2].copy_from_slice(&unit.to_le_bytes());
++        }
++        fs::write(path, disk).unwrap();
++    }
++
++    fn guid_to_gpt(value: &str) -> [u8; 16] {
++        let canonical = (0..16)
++            .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap())
++            .collect::<Vec<_>>();
++        [
++            canonical[3],
++            canonical[2],
++            canonical[1],
++            canonical[0],
++            canonical[5],
++            canonical[4],
++            canonical[7],
++            canonical[6],
++            canonical[8],
++            canonical[9],
++            canonical[10],
++            canonical[11],
++            canonical[12],
++            canonical[13],
++            canonical[14],
++            canonical[15],
++        ]
++    }
++
++    fn hyphenated(value: &str) -> String {
++        format!(
++            "{}-{}-{}-{}-{}",
++            &value[0..8],
++            &value[8..12],
++            &value[12..16],
++            &value[16..20],
++            &value[20..32]
++        )
++    }
++}

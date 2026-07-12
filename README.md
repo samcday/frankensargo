@@ -195,6 +195,14 @@ the canonical hash and apply the semantic/device-binding checks described in
 the [inventory snapshot contract](docs/inventory-snapshot-v1.md); schema-valid
 JSON alone is not verified evidence or takeover authorization.
 
+The host-side [PBREAD1 backup controller](docs/pbread1-backup.md) turns that
+inventory into an immutable, exact-serial run manifest and a resumable 64 MiB
+chunk plan. It validates a device-produced identity/hash envelope for every
+chunk, atomically journals only verified data, assembles a raw image, and
+requires an independent full source hash to match the freshly read destination
+hash. `--dry-run` and `--offline-source` exercise the complete host workflow
+without contacting a phone; no userdata write is part of this tool.
+
 The verified 7,831,552-byte image had SHA-256
 `98983cc3331de0f08d6a578b89f87f2b5003607e30cb7ae5d218eb56612d48a6`.
 PocketBoot displayed its UI and accepted touch input. It re-enumerated as USB

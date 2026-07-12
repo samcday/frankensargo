@@ -1,0 +1,47 @@
+diff --git a/src/fastboot/mod.rs b/src/fastboot/mod.rs
+index 0d51f680321b3497e739c72c2736097521604e2b..69994fb5d2c5490a39c3a4b6b9e3b2d513a8fa58 100644
+--- a/src/fastboot/mod.rs
++++ b/src/fastboot/mod.rs
+@@ -26,6 +26,9 @@ const COMMAND_MAX: usize = 64;
+ const DOWNLOAD_PREFIX: &str = "download:";
+ pub(crate) const MAX_DOWNLOAD_SIZE: u32 = 256 * 1024 * 1024;
+ const TRANSFER_CHUNK: usize = 1024 * 1024;
++// gadgetry-most-foul splits writes into 16 KiB AIO requests. Sargo's DWC3
++// rejects concurrent IN requests, so keep exactly one upload request in flight.
++const FASTBOOT_TX_QUEUE_LEN: u32 = 1;
+ const RESPONSE_MAX: usize = 64;
+ const RESPONSE_STATUS_LEN: usize = 4;
+ const RESPONSE_PAYLOAD_MAX: usize = RESPONSE_MAX - RESPONSE_STATUS_LEN;
+@@ -133,7 +136,7 @@ pub(crate) struct UsbFunction {
+ impl UsbFunction {
+     pub(crate) fn new(commands: CommandMap) -> Self {
+         let (rx, rx_dir) = EndpointDirection::host_to_device();
+-        let (tx, tx_dir) = EndpointDirection::device_to_host();
++        let (tx, tx_dir) = fastboot_device_to_host();
+         let (custom, handle) = Custom::builder()
+             .with_interface(
+                 Interface::new(
+@@ -645,6 +648,11 @@ fn transfer_buffer(len: usize) -> io::Result<Vec<u8>> {
+     Ok(buffer)
+ }
+ 
++fn fastboot_device_to_host() -> (EndpointIn, EndpointDirection) {
++    let (endpoint, direction) = EndpointDirection::device_to_host();
++    (endpoint, direction.with_queue_len(FASTBOOT_TX_QUEUE_LEN))
++}
++
+ fn find_command_handler<'a>(
+     commands: &'a [Command],
+     command: &str,
+@@ -836,4 +844,11 @@ mod tests {
+             );
+         }
+     }
++
++    #[test]
++    fn serializes_device_to_host_aio_requests() {
++        let (_endpoint, direction) = fastboot_device_to_host();
++
++        assert_eq!(direction.queue_len, 1);
++    }
+ }

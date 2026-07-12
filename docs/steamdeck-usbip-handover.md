@@ -1,8 +1,10 @@
 # Steam Deck remote-lab handover
 
 This records the 2026-07-11 USB/IP experiment and the preferred 2026-07-12
-Deck-local path from `sam-desktop` to frankensargo through `steamdeck`. No
-phone partition was mounted or written.
+Deck-local path from `sam-desktop` to frankensargo through `steamdeck`.
+`userdata` was never mounted or written. The sole persistent phone-side change
+in the direct-cable work was an explicit `set_active a`, which reset A/B
+boot-control metadata; no boot image or partition payload was flashed.
 
 ## Topology and identities
 
@@ -10,8 +12,9 @@ phone partition was mounted or written.
 - Steam Deck kernel: `6.11.11-valve27-1-neptune-611-g60ef8556a811`.
 - Frankensargo PocketBoot gadget during the USB/IP run: Deck bus ID `3-1.4`,
   USB `1d6b:0104`, serial `99NAY1AZG1`, five interfaces (ACM, fastboot, ADB,
-  and mass storage). A replacement cable later put stock fastboot and the
-  gadget on physical port `3-1.1`.
+  and mass storage). Direct Deck attachment used physical port `3-1.1`. The
+  first cable produced a sustained reset storm there; its replacement gave a
+  clean exact-serial enumeration.
 - Frankensargo's proven FTDI UART: Deck bus ID `3-1.3.4.3.1`, normally
   `ttyUSB1`, USB `0403:6001`. Another FT232 is at `3-1.3.4.3.4`; both clone
   serial `A50285BI`, so `/dev/serial/by-id` collides and is not identity.
@@ -86,8 +89,29 @@ On 2026-07-12, a `systemd-run --user` socat capture survived roughly eleven
 hours and recorded a complete stock reboot. ABL's eMMC serial `11182ce7`
 matches the known CID, proving the UART-to-phone binding. Slot A then failed
 with `Invalid boot magic` and `BootPrepareAsync Volume Corrupt` and entered
-bootloader mode. This was observed, not repaired; no boot partition was
-flashed.
+bootloader mode. Stock fastboot captured this pre-repair state:
+
+```text
+current-slot=a
+slot-count=2
+slot-suffixes=_a,_b
+has-slot:boot=yes
+slot-unbootable:a=yes  slot-successful:a=no  slot-retry-count:a=0
+slot-unbootable:b=no   slot-successful:b=no  slot-retry-count:b=3
+```
+
+ABL refused a transient boot while active slot A was unbootable. The one
+boot-metadata write in this session was deliberately explicit:
+
+```sh
+fastboot -s 99NAY1AZG1 set_active a
+```
+
+It left `current-slot=a`, cleared `slot-unbootable:a`, and restored
+`slot-retry-count:a=3`. The following transient boot succeeded; its kernel
+command line reported `androidboot.slot_retry_count=2`, consistent with ABL
+consuming one attempt. No `flash` or `erase` command was issued, and neither
+boot partition was rewritten.
 
 A replacement cable exposed stock fastboot as `18d1:4ee0`, exact serial
 `99NAY1AZG1`. `fedora-latest` is a Fedora 44 distrobox and could access the USB
@@ -95,19 +119,21 @@ device unprivileged. The actual transient boot used official fastboot
 `37.0.0-14910828`, SHA-256
 `76dde33fee8b1fd00bcaf2e7f94ddef6407f0beb5bc3a98a3d4127307af23f3a`,
 from the shared staging directory. It downloaded the verified 7,831,552-byte
-PocketBoot image and booted it without `flash`, `erase`, or a slot change.
+PocketBoot image and booted it without `flash` or `erase`; the preceding
+same-slot retry reset is the only boot-control mutation and is recorded above.
 
-Fedora's packaged `android-tools-35.0.2-17.fc44` was already installed and is
-the preferred repeatable interface. A future transient boot can stay entirely
-inside the distrobox after verifying the shared image:
+Fedora's packaged `android-tools-35.0.2-17.fc44` is the preferred repeatable
+interface. Use the named-container form so noninteractive sessions do not
+depend on Distrobox's shorthand parsing. A future transient boot can stay
+entirely inside the distrobox after verifying the shared image:
 
 ```sh
-sha256sum /home/deck/.local/share/frankensargo-lab/pocketboot-sargo-lab.img
-distrobox enter fedora-latest -- \
+distrobox enter --name fedora-latest -- bash -lc '
+  sha256sum /home/deck/.local/share/frankensargo-lab/pocketboot-sargo-lab.img
   /usr/bin/fastboot -s 99NAY1AZG1 getvar product
-distrobox enter fedora-latest -- \
   /usr/bin/fastboot -s 99NAY1AZG1 boot \
-  /home/deck/.local/share/frankensargo-lab/pocketboot-sargo-lab.img
+    /home/deck/.local/share/frankensargo-lab/pocketboot-sargo-lab.img
+'
 ```
 
 The required image digest is
@@ -115,15 +141,13 @@ The required image digest is
 After the boot, these checks passed from inside the same distrobox:
 
 ```sh
-distrobox enter fedora-latest -- \
+distrobox enter --name fedora-latest -- bash -lc '
   /usr/bin/fastboot -s 99NAY1AZG1 getvar product
-distrobox enter fedora-latest -- \
   /usr/bin/adb -s 99NAY1AZG1 get-state
-distrobox enter fedora-latest -- \
   /usr/bin/adb -s 99NAY1AZG1 shell /usr/bin/id
-distrobox enter fedora-latest -- \
   /usr/bin/adb -s 99NAY1AZG1 shell /bin/cat \
-  /sys/block/mmcblk0/device/cid
+    /sys/block/mmcblk0/device/cid
+'
 ```
 
 They returned product `pocketboot`, ADB state `recovery`, `uid=0 gid=0`, and
@@ -139,10 +163,15 @@ With no other reader holding that path, enter the root shell from the
 distrobox with:
 
 ```sh
-distrobox enter fedora-latest -- \
-  /usr/bin/socat -,rawer,echo=0 \
-  /dev/serial/by-path/pci-0000:04:00.3-platform-xhci-hcd.2.auto-usb-0:1.3.4.3.1:1.0-port0,b115200,rawer,echo=0
+distrobox enter --name fedora-latest -- bash -lc '
+  uart=$(readlink -f \
+    /dev/serial/by-path/pci-0000:04:00.3-platform-xhci-hcd.2.auto-usb-0:1.3.4.3.1:1.0-port0)
+  exec /usr/bin/socat -,rawer,echo=0 "$uart",b115200,rawer,echo=0
+'
 ```
+
+Resolving the stable symlink first is important: the literal by-path name
+contains colons, which `socat` otherwise interprets as address syntax.
 
 The UART journal showed both `tty0` and `ttyMSM0` getty supervisors at 115200
 and a BusyBox 1.38.0 prompt. Interactive read-only commands then proved:
@@ -164,6 +193,57 @@ sacrificial lab device, not a production-safe default. Distrobox shares the
 host's home and devices and is not a security boundary. The raw UART journal
 also contains identifiers and terminal bytes and should be reviewed before
 publication.
+
+The container has native fastboot, ADB, and socat access to the host devices.
+It does not have `usbutils`; inspect topology without changing the container
+or leaving the canonical command surface with:
+
+```sh
+distrobox enter --name fedora-latest -- \
+  distrobox-host-exec /usr/bin/lsusb -t
+```
+
+## Direct-cable USB-IN failure and patch boundary
+
+The first direct cable did not merely enumerate slowly. From 09:48:32 through
+09:49:08 the Deck logged a continuous series of high-speed resets for device
+43 at `3-1.1`. After the cable swap, device 44 enumerated cleanly at 09:51:13
+as `1d6b:0104`, product and manufacturer `pocketboot`, serial `99NAY1AZG1`.
+That instance disconnected at 09:52:00 without another reset storm. The new
+cable removed one transport fault, but it did not fix the device-to-host DWC3
+queue failure described below.
+
+Bounded tests on the unpatched image separated payload size from payload
+source:
+
+| Device-to-host path | 64 KiB | 4 MiB | Observation |
+|---|---:|---:|---|
+| Sequential ADB output | passed | passed | Unpatched ADB can carry both sizes when writes remain sequential. |
+| Synthetic fastboot staged data | passed | passed | A fastboot upload of this size can succeed; size alone is not the trigger. |
+| Real `userdata` fastboot staging/upload | not needed | failed | Reading and staging completed, but the upload wedged on USB IN. |
+
+The real test read exactly 4 MiB from `userdata`; it did not write the block
+device. At about kernel time `t=227s`, UART recorded five
+`dwc3 ... was not queued to ep3in` errors. PocketBoot then reported
+`timeout waiting for exact AIO transfer` and its userspace fastboot server
+exited. This is the repeatable failure signature. No received file from that
+attempt is backup evidence.
+
+`gadgetry-most-foul` defaults the endpoint direction to a queue depth of 16
+and splits a logical write into 16 KiB AIO requests. PocketBoot's fastboot
+transfer buffer remains 1 MiB, so one upload write can present many requests
+to the endpoint concurrently. The focused
+[`0003-serialize-fastboot-upload-writes.patch`](../patches/pocketboot/0003-serialize-fastboot-upload-writes.patch)
+changes only the fastboot device-to-host endpoint direction to
+`queue_len=1`. It does not change the 16 KiB internal chunk, ADB, mass
+storage, fastboot host-to-device downloads, or any storage command. Hardware
+validation of that patched image is still required before trusting a large
+readback.
+
+Across all of these tests, `userdata` retained its original identity and
+content state: it was only read, never mounted read-write, erased, formatted,
+or used as an output target. In particular, no `pvcreate` or other LVM write
+has occurred.
 
 ## If USB/IP is retried
 
