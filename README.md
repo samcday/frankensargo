@@ -184,6 +184,11 @@ The first command emits the anchor-only and full-allowlist discovery stages.
 The second emits a hash-bound authorization plan and confirmation token.
 Neither emits a write command.
 
+The loader-neutral PocketBlue sdm670 experiment, its verified dracut/LVM
+contract, exact artifact hashes, safe interrupted-import checkpoint, and
+resumable continuation are recorded in the
+[PocketBlue sdm670 LVM runbook](docs/pocketblue-sdm670-lvm.md).
+
 ## Frankensargo hardware bring-up
 
 Two sargos are in play. `dev-sargo` is the future daily driver and remains
