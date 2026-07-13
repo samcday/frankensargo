@@ -137,9 +137,10 @@ verifier above rather than accepting a checksum sidecar by itself.
 `make check` uses regular sparse files. `build-pocketboot` builds files only
 and never runs fastboot; the full invocation writes the image, checksum, and
 input/patch provenance under `out/pocketboot/`. Source revisions are pinned in
-[`config/sources.lock`](config/sources.lock); the sdm670 beta4 kernel remains
-pinned until a frankensargo UART, USB gadget, storage, and kexec smoke test says
-otherwise.
+[`config/sources.lock`](config/sources.lock). The pinned sdm670 beta4 revision
+is the kernel used by the successful 2026-07-13 UART, storage, and kexec proof;
+moving it requires a new hardware qualification rather than assuming a newer
+tree is equivalent.
 
 The current PocketBoot patch is an intentionally interim bridge to the final
 two-stage contract. It can bind discovery to exactly one
@@ -147,15 +148,19 @@ two-stage contract. It can bind discovery to exactly one
 rejects removable, missing, duplicate, or ambiguous matches, and otherwise
 leaves LVM discovery disabled. It does **not** yet read `ggmeta` or validate the
 manifest's PARTUUID/PV-UUID tuples. The generic lab artifact therefore carries
-no invented storage UUIDs; a capsule-binding generator comes only after the
-frankensargo has a real anchor VG.
+no invented storage UUIDs. `bin/build-pocketboot-bound` now composes the exact
+observed serial, VG UUID, and PV PARTUUID into a provenance-recorded lab image;
+it remains an interim bridge until `ggmeta` supplies the complete manifest
+contract.
 
 The stack also implements the raw, non-PTY subset of standard ADB `shell_v2`.
 Bootstrap and Duranium import commands use one shared exact-serial host client
 that proves fresh separated stdout/stderr and a typed exit frame, then rejects
 legacy status zero and truncated streams on every argv. This support is in
 patch `0013-adb-shell-v2-status.patch`; it has passed the host and PocketBoot
-test suites but is not present in either previously staged hardware image.
+test suites and is present in the successful 2026-07-13 bound image. That boot
+does not by itself qualify the mutation controllers' large raw `shell_v2`
+transport.
 
 The old nested-MBR userdata planner remains as compatibility/bootstrap
 research, not the final layout:
@@ -198,6 +203,18 @@ it, although temporary lab tools and traces were staged under `/var/tmp`.
 
 `frankensargo`, fastboot serial `99NAY1AZG1`, is the experimental target for
 this project.
+
+The current hardware checkpoint is a successful loader-neutral PocketBlue boot
+from LVM on 2026-07-13. A transient, identity-bound PocketBoot activated only
+the tagged XBOOTLDR LV, found its BLS entry, and kexeced Fedora with exact
+`rd.lvm.lv=` requests for root, XBOOTLDR, and ESP. Downstream, the Btrfs LV
+backed the OSTree/composefs root, the ext4 LV mounted at `/boot`, and the vfat
+LV mounted at `/boot/efi`. UART login, `serial-getty@ttyMSM0`,
+`systemd-homed`, and BREAK-plus-`h` Magic SysRq were all proven live. Android's
+GPT and `boot_a`/`boot_b` were not changed. The bound PocketBoot image SHA-256
+is `988ba0fb069f1dc6ae88c0267f6ccd267090da2acf5ef942d1da9bfe2e4df06c`;
+the complete evidence and known firmware-integration gap are in the
+[PocketBlue sdm670 LVM runbook](docs/pocketblue-sdm670-lvm.md).
 
 That downstream attempt exposed a sustained USB bulk-OUT failure in
 `dev-sargo`'s experimental host path. PocketBoot never started. The topology,
@@ -312,7 +329,8 @@ An earlier bounded-read control ended in a target-side ACM/configfs teardown
 deadlock after a USB `EPROTO`. The latest safe-teardown control reproduced the
 same transfer failure but dismantled the gadget cleanly and retained a
 respawning UART getty; `userdata` was still read-only and no mutating LVM
-command had run. Frankensargo currently needs a physical reset into ABL.
+command had run. At that historical checkpoint, frankensargo needed a physical
+reset into ABL.
 Two fresh-boot controls are staged on the Deck: a no-ACM image, SHA-256
 `3e5fa16a…`, and an ACM plus DWC3 `tx-fifo-resize` plus safe-teardown image,
 SHA-256 `4b628a5c…`.
@@ -322,20 +340,18 @@ and one-boot comparison rule are in the
 [Steam Deck handover](docs/steamdeck-usbip-handover.md). Neither image is yet
 evidence that large USB reads work.
 
-The remaining sequence is deliberately incremental:
+The userdata anchor VG now exists and the PocketBlue proof above supersedes the
+old pre-bootstrap sequence. Expansion remains deliberately incremental:
 
-1. use one fresh ABL boot per USB control and prove a repeatable large PBREAD;
-2. recapture the canonical inventory and make a complete, independently
-   rehashed 53,648,801,280-byte off-device `userdata` backup;
-3. run the hardened takeover executor through its read-only step-0 preflight;
-4. export and verify the exact hash-bound bootstrap plan and explicit consent;
-5. authorize only `userdata` as the anchor PV and checkpoint every mutation;
-6. create `ggmeta`, `boot-rescue`, critical LVs, and the thin-data pool;
-7. import and locally hash-verify Duranium before publishing its disk LV;
-8. build the observed-UUID-bound PocketBoot capsule and boot Duranium; and
-9. import factory artifacts without touching donors, then authorize each later
-   donor independently, with a reboot while it is fenced
-   before releasing its extents for allocation.
+1. rebuild PocketBlue with its dynamic-partition mapper package and prove the
+   modem/GPU firmware path without changing the LVM boot contract;
+2. preserve the known-good PocketBoot provenance, LV hashes, VG metadata, and
+   a usable rescue path;
+3. import and locally hash-verify Duranium, then prove its nested-disk boot;
+4. archive and reconstruct every Android dynamic-partition extent before
+   considering any donor partition; and
+5. authorize each donor independently, reboot while it is fenced, and only
+   then release its extents for allocation.
 
 No guessed `/dev/mmcblk0pNN` name is ever authority. No `pvcreate`, `vgextend`,
 slot switch, reboot, flash, or serial write belongs in discovery.

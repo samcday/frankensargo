@@ -472,6 +472,7 @@ build first:
 
 ```sh
 bin/build-pocketboot-bound --no-acm --prepare-only \
+  --serialno "$SERIAL" \
   --vg-uuid "$VG_UUID" \
   --pv-partuuid "$USERDATA_PARTUUID" \
   --kernel-tree /home/deck/src/linux-sdm670-mainline
@@ -481,13 +482,16 @@ Then build into a fresh destination:
 
 ```sh
 bin/build-pocketboot-bound --no-acm \
+  --serialno "$SERIAL" \
   --vg-uuid "$VG_UUID" \
   --pv-partuuid "$USERDATA_PARTUUID" \
   --kernel-tree /home/deck/src/linux-sdm670-mainline \
   --output-dir "$DURABLE_STATE/pocketboot-bound"
 ```
 
-The wrapper validates both values, invokes the exact generic patch-stack
+Here `$SERIAL` is the exact serial observed during the fenced device inventory,
+not an example device identifier. The wrapper validates the serial and both
+storage values, invokes the exact generic patch-stack
 preparer, takes the same exclusive source lock as generic builds, journals the
 original configuration, and composes removal of exactly one `pocketboot.acm`
 token with the binding. It records the base/profile/bound command lines and

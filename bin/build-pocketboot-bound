@@ -37,6 +37,7 @@ PROVENANCE_FORMAT = "org.frankensargo.pocketboot-bound-image/1"
 LVM_UUID_RE = re.compile(
     r"[A-Za-z0-9]{6}(?:-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}\Z"
 )
+SERIALNO_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:-]{0,127}\Z")
 SOURCE_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_JOURNAL_BYTES = 64 * 1024
@@ -85,6 +86,12 @@ def checked_partuuid(value: str) -> str:
     return canonical
 
 
+def checked_serialno(value: str) -> str:
+    if not SERIALNO_RE.fullmatch(value):
+        fail(f"invalid device serial number: {value}")
+    return value
+
+
 def load_sources(path: Path = SOURCES_LOCK) -> dict[str, str]:
     result: dict[str, str] = {}
     try:
@@ -131,9 +138,16 @@ def canonical_cmdline(value: str, field: str) -> str:
     return value
 
 
-def bound_cmdline(base: str, vg_uuid: str, partuuids: list[str]) -> str:
+def bound_cmdline(
+    base: str, vg_uuid: str, partuuids: list[str], serialno: str
+) -> str:
+    serialno = checked_serialno(serialno)
     base = canonical_cmdline(base, "base PocketBoot cmdline")
-    tokens = base.split(" ")
+    tokens = [
+        token
+        for token in base.split(" ")
+        if not token.startswith("androidboot.serialno=")
+    ]
     if tokens.count("sysrq_always_enabled=1") != 1:
         fail("base PocketBoot cmdline lacks exactly one sysrq_always_enabled=1")
     for token in tokens:
@@ -144,6 +158,7 @@ def bound_cmdline(base: str, vg_uuid: str, partuuids: list[str]) -> str:
     suffix = [f"pocketboot.vg_uuid={vg_uuid}"] + [
         f"pocketboot.pv_partuuid={partuuid}" for partuuid in partuuids
     ]
+    suffix.append(f"androidboot.serialno={serialno}")
     return canonical_cmdline(" ".join([*tokens, *suffix]), "bound PocketBoot cmdline")
 
 
@@ -151,6 +166,7 @@ def render_bound_config(
     original: bytes,
     vg_uuid: str,
     partuuids: list[str],
+    serialno: str,
     *,
     no_acm: bool = False,
 ) -> tuple[bytes, str, str, str]:
@@ -170,7 +186,7 @@ def render_bound_config(
         profile_cmdline = without_acm_cmdline(base) if no_acm else base
     except ProfileError as error:
         fail(f"invalid no-ACM profile: {error}")
-    result_cmdline = bound_cmdline(profile_cmdline, vg_uuid, partuuids)
+    result_cmdline = bound_cmdline(profile_cmdline, vg_uuid, partuuids, serialno)
     try:
         text = original.decode("utf-8")
     except UnicodeDecodeError:
@@ -423,6 +439,7 @@ def provenance(
     output_name: str,
     vg_uuid: str,
     partuuids: list[str],
+    serialno: str,
     patches: list[dict[str, str]],
 ) -> bytes:
     value: dict[str, object] = {
@@ -433,6 +450,7 @@ def provenance(
         "binding": {
             "vg_uuid": vg_uuid,
             "pv_partuuids": partuuids,
+            "serialno": serialno,
             "kernel_cmdline": bound_cmdline_value,
         },
         "pocketboot": {
@@ -478,8 +496,14 @@ def parser(sources: dict[str, str]) -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description=(
             "Build a sargo PocketBoot image whose Android kernel command line "
-            "is bound to one observed VG UUID and explicit PV PARTUUID allowlist."
+            "is bound to one observed device serial, VG UUID, and explicit PV "
+            "PARTUUID allowlist."
         )
+    )
+    result.add_argument(
+        "--serialno",
+        required=True,
+        help="exact observed device serial to preserve across PocketBoot self-kexec",
     )
     result.add_argument("--vg-uuid", required=True)
     result.add_argument("--pv-partuuid", required=True, action="append")
@@ -505,6 +529,7 @@ def install_signal_handlers() -> None:
 
 
 def build(args: argparse.Namespace, sources: dict[str, str]) -> dict[str, object]:
+    serialno = checked_serialno(args.serialno)
     vg_uuid = checked_lvm_uuid(args.vg_uuid)
     partuuids = [checked_partuuid(value) for value in args.pv_partuuid]
     if len(set(partuuids)) != len(partuuids):
@@ -558,7 +583,7 @@ def build(args: argparse.Namespace, sources: dict[str, str]) -> dict[str, object
         original = config.read_bytes()
         mode = stat.S_IMODE(config.stat().st_mode)
         bound, base_cmdline, profile_cmdline, bound_value = render_bound_config(
-            original, vg_uuid, partuuids, no_acm=args.no_acm
+            original, vg_uuid, partuuids, serialno, no_acm=args.no_acm
         )
         base_tree = worktree_tree(source, revision)
         write_journal(journal, original, bound, base_tree, bound_value)
@@ -578,6 +603,7 @@ def build(args: argparse.Namespace, sources: dict[str, str]) -> dict[str, object
                     "base_cmdline": base_cmdline,
                     "profile_cmdline": profile_cmdline,
                     "bound_cmdline": bound_value,
+                    "serialno": serialno,
                     "vg_uuid": vg_uuid,
                     "pv_partuuids": partuuids,
                 }
@@ -643,6 +669,7 @@ def build(args: argparse.Namespace, sources: dict[str, str]) -> dict[str, object
             output_name=output_name,
             vg_uuid=vg_uuid,
             partuuids=partuuids,
+            serialno=serialno,
             patches=patches,
         )
         if patch_records() != patches:
@@ -668,6 +695,7 @@ def build(args: argparse.Namespace, sources: dict[str, str]) -> dict[str, object
             "base_cmdline": base_cmdline,
             "profile_cmdline": profile_cmdline,
             "bound_cmdline": bound_value,
+            "serialno": serialno,
         }
     except BaseException:
         for path in reversed(published):

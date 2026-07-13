@@ -44,6 +44,7 @@ io_bytes=${FRANKENSARGO_WRITE_IO_BYTES:-$((4 * 1024 * 1024))}
 (( chunk_bytes > 0 && io_bytes > 0 && io_bytes % 512 == 0 && chunk_bytes % io_bytes == 0 )) ||
     die "chunk size must be a positive multiple of the 512-byte-aligned I/O size"
 chunks=$(((size + chunk_bytes - 1) / chunk_bytes))
+target_guard="test -b $target && test \"\$(blockdev --getro $target)\" = 0 && test \"\$(blockdev --getsize64 $target)\" -ge $size"
 
 wait_for_adb()
 {
@@ -51,6 +52,13 @@ wait_for_adb()
         printf 'write-lv-resumable: waiting for %s\n' "$serial" >&2
         sleep 1
     done
+}
+
+assert_remote_target()
+{
+    wait_for_adb
+    adb -s "$serial" shell "$target_guard" >/dev/null 2>&1 ||
+        die "target is not a writable block device large enough for the source: $target"
 }
 
 extract_hash()
@@ -65,16 +73,18 @@ remote_chunk_hash()
     wait_for_adb
     if (( count == chunk_bytes )); then
         output=$(adb -s "$serial" shell \
-            "dd if=$target bs=$io_bytes skip=$((offset / io_bytes)) count=$((chunk_bytes / io_bytes)) 2>/dev/null | sha256sum" \
+            "$target_guard && dd if=$target bs=$io_bytes skip=$((offset / io_bytes)) count=$((chunk_bytes / io_bytes)) 2>/dev/null | sha256sum" \
             2>/dev/null) || :
     else
         output=$(adb -s "$serial" shell \
-            "dd if=$target bs=512 skip=$((offset / 512)) count=$((count / 512)) 2>/dev/null | sha256sum" \
+            "$target_guard && dd if=$target bs=512 skip=$((offset / 512)) count=$((count / 512)) 2>/dev/null | sha256sum" \
             2>/dev/null) || :
     fi
     hash=$(printf '%s\n' "$output" | extract_hash)
     [[ -n $hash ]] && printf '%s\n' "$hash"
 }
+
+assert_remote_target
 
 for ((index = 0; index < chunks; index++)); do
     offset=$((index * chunk_bytes))
@@ -94,12 +104,12 @@ for ((index = 0; index < chunks; index++)); do
     verified=no
     for attempt in $(seq 1 20); do
         printf 'chunk %d/%d write attempt %d\n' "$((index + 1))" "$chunks" "$attempt"
-        wait_for_adb
+        assert_remote_target
         set +e
         dd if="$source" bs="$io_bytes" skip=$((offset / io_bytes)) \
             count=$((chunk_bytes / io_bytes)) status=none |
             adb -s "$serial" shell \
-                "dd of=$target bs=$io_bytes seek=$((offset / io_bytes)) conv=notrunc" \
+                "$target_guard && exec dd of=$target bs=$io_bytes seek=$((offset / io_bytes))" \
                 >/dev/null 2>&1
         set -e
 
@@ -116,5 +126,6 @@ for ((index = 0; index < chunks; index++)); do
 done
 
 wait_for_adb
-adb -s "$serial" shell sync >/dev/null 2>&1 || :
+adb -s "$serial" shell sync >/dev/null 2>&1 ||
+    die "remote sync failed; rerun the same command to verify and sync"
 printf 'write-lv-resumable: all %d chunks verified; source sha256 %s\n' "$chunks" "$expected"

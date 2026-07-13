@@ -1,0 +1,106 @@
+diff --git a/src/lvm.rs b/src/lvm.rs
+--- a/src/lvm.rs
++++ b/src/lvm.rs
+@@ -375,7 +375,7 @@ struct RawLogicalVolume {
+     lv_uuid: String,
+     vg_tags: Vec<String>,
+     lv_tags: Vec<String>,
+-    lv_active: u8,
++    lv_active: i8,
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -458,11 +458,23 @@ fn parse_candidates(json: &[u8], expected_vg_uuid: &LvmUuid) -> Result<Vec<Cand
+         validate_lvm_name("LV", &raw.lv_name)?;
+         let vg_uuid = LvmUuid::parse("VG", raw.vg_uuid)?;
+         let lv_uuid = LvmUuid::parse("LV", raw.lv_uuid)?;
+-        if raw.lv_active != 0 {
+-            return Err(format!(
+-                "PocketBoot LVM candidate is already active: {}/{} ({})",
+-                raw.vg_name, raw.lv_name, lv_uuid.display
+-            ));
++        match raw.lv_active {
++            // A global `lvs --readonly` report uses -1 when activation state is
++            // unknown.  The sysfs fence below independently rejects any
++            // pre-existing mapping before PocketBoot requests activation.
++            -1 | 0 => {}
++            1 => {
++                return Err(format!(
++                    "PocketBoot LVM candidate is already active: {}/{} ({})",
++                    raw.vg_name, raw.lv_name, lv_uuid.display
++                ));
++            }
++            state => {
++                return Err(format!(
++                    "PocketBoot LVM candidate has invalid lv_active state {state}: {}/{} ({})",
++                    raw.vg_name, raw.lv_name, lv_uuid.display
++                ));
++            }
+         }
+ 
+         if !lv_uuids.insert(lv_uuid.compact.clone()) {
+@@ -999,6 +1011,55 @@ fn refuses_preexisting_or_reported_active_candidates() {
+         assert!(error.contains("candidate is already active"));
+         assert_eq!(runner.calls.borrow().len(), 1);
+     }
++
++    #[test]
++    fn accepts_readonly_unknown_activity_state_with_sysfs_fence() {
++        let temp = TempDir::new();
++        let mut unknown = raw_lv(
++            "greygoo",
++            "boot",
++            VG_UUID,
++            LV_UUID,
++            &[VG_TAG],
++            &[BOOTFS_TAG],
++        );
++        unknown.lv_active = -1;
++        let runner = RecordingRunner::report_then_dm(
++            report_json(&[unknown]),
++            &temp.path,
++            "dm-7",
++            &dm_uuid(VG_UUID, LV_UUID),
++            "1",
++        );
++
++        let volumes = activate_tagged_with(&runner, &temp.path, VG_UUID, &devices()).unwrap();
++
++        assert_eq!(volumes.len(), 1);
++        assert_eq!(volumes[0].lv_uuid, LV_UUID);
++        assert_eq!(runner.calls.borrow().len(), 2);
++    }
++
++    #[test]
++    fn rejects_invalid_signed_activity_states() {
++        for state in [-2, 2] {
++            let mut invalid = raw_lv(
++                "greygoo",
++                "boot",
++                VG_UUID,
++                LV_UUID,
++                &[VG_TAG],
++                &[BOOTFS_TAG],
++            );
++            invalid.lv_active = state;
++            let runner = RecordingRunner::success(report_json(&[invalid]), 0);
++
++            let error = activate_tagged_with(&runner, Path::new("unused"), VG_UUID, &devices())
++                .unwrap_err();
++
++            assert!(error.contains(&format!("invalid lv_active state {state}")));
++            assert_eq!(runner.calls.borrow().len(), 1);
++        }
++    }
+ 
+     #[test]
+     fn rejects_wrong_dm_uuid() {
+@@ -1086,7 +1147,7 @@ struct TestLv {
+         lv_uuid: String,
+         vg_tags: Vec<String>,
+         lv_tags: Vec<String>,
+-        lv_active: u8,
++        lv_active: i8,
+     }
+ 
+     fn raw_lv(

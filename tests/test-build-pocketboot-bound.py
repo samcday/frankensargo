@@ -17,6 +17,7 @@ MODULE = runpy.run_path(str(TOOL), run_name="frankensargo_bound_builder_test")
 BuildError = MODULE["BuildError"]
 PARTUUID = "db04e713-11c3-4d68-bec2-8cc483bd3891"
 VG_UUID = "BBBBBB-1111-2222-3333-4444-5555-CCCCCC"
+SERIALNO = "99NAY1AZG1"
 BASE_CMDLINE = "pocketboot.log=debug pocketboot.acm sysrq_always_enabled=1"
 NO_ACM_CMDLINE = "pocketboot.log=debug sysrq_always_enabled=1"
 
@@ -30,14 +31,15 @@ class BoundPocketBootTests(unittest.TestCase):
             'bootimg_version = 2\n'
         ).encode()
         rendered, base, profile, bound = MODULE["render_bound_config"](
-            original, VG_UUID, [PARTUUID]
+            original, VG_UUID, [PARTUUID], SERIALNO
         )
         self.assertEqual(base, BASE_CMDLINE)
         self.assertEqual(profile, BASE_CMDLINE)
         self.assertEqual(
             bound,
             BASE_CMDLINE
-            + f" pocketboot.vg_uuid={VG_UUID} pocketboot.pv_partuuid={PARTUUID}",
+            + f" pocketboot.vg_uuid={VG_UUID} pocketboot.pv_partuuid={PARTUUID}"
+            + f" androidboot.serialno={SERIALNO}",
         )
         self.assertIn(f"cmdline = {json.dumps(bound)}\n".encode(), rendered)
         self.assertTrue(rendered.endswith(b'bootimg_version = 2\n'))
@@ -51,7 +53,7 @@ class BoundPocketBootTests(unittest.TestCase):
             'header_version = 2\n'
         ).encode()
         rendered, base, profile, bound = MODULE["render_bound_config"](
-            original, VG_UUID, [PARTUUID], no_acm=True
+            original, VG_UUID, [PARTUUID], SERIALNO, no_acm=True
         )
         self.assertEqual(base, BASE_CMDLINE)
         self.assertEqual(profile, NO_ACM_CMDLINE)
@@ -59,14 +61,15 @@ class BoundPocketBootTests(unittest.TestCase):
         self.assertEqual(
             bound,
             profile
-            + f" pocketboot.vg_uuid={VG_UUID} pocketboot.pv_partuuid={PARTUUID}",
+            + f" pocketboot.vg_uuid={VG_UUID} pocketboot.pv_partuuid={PARTUUID}"
+            + f" androidboot.serialno={SERIALNO}",
         )
         self.assertIn(f"cmdline = {json.dumps(bound)}\n".encode(), rendered)
 
     def test_rejects_top_level_only_cmdline_fixture(self):
         original = f"cmdline = {json.dumps(BASE_CMDLINE)}\n".encode()
         with self.assertRaisesRegex(BuildError, "forbidden top-level"):
-            MODULE["render_bound_config"](original, VG_UUID, [PARTUUID])
+            MODULE["render_bound_config"](original, VG_UUID, [PARTUUID], SERIALNO)
 
     def test_rejects_existing_binding_duplicate_partuuid_and_bad_sysrq_policy(self):
         with self.assertRaisesRegex(BuildError, "already contains an LVM binding"):
@@ -74,11 +77,52 @@ class BoundPocketBootTests(unittest.TestCase):
                 BASE_CMDLINE + " pocketboot.vg_uuid=" + VG_UUID,
                 VG_UUID,
                 [PARTUUID],
+                SERIALNO,
             )
         with self.assertRaisesRegex(BuildError, "exactly one sysrq"):
-            MODULE["bound_cmdline"]("pocketboot.acm", VG_UUID, [PARTUUID])
+            MODULE["bound_cmdline"](
+                "pocketboot.acm", VG_UUID, [PARTUUID], SERIALNO
+            )
         with self.assertRaisesRegex(BuildError, "canonical lowercase"):
             MODULE["checked_partuuid"](PARTUUID.upper())
+
+    def test_replaces_all_existing_serial_tokens_with_one_exact_final_token(self):
+        base = (
+            BASE_CMDLINE
+            + " androidboot.serialno=STALE androidboot.serialno=ALSO-STALE"
+        )
+        bound = MODULE["bound_cmdline"](base, VG_UUID, [PARTUUID], SERIALNO)
+        self.assertNotIn("androidboot.serialno=STALE", bound)
+        self.assertNotIn("androidboot.serialno=ALSO-STALE", bound)
+        self.assertEqual(bound.split().count(f"androidboot.serialno={SERIALNO}"), 1)
+        self.assertTrue(bound.endswith(f"androidboot.serialno={SERIALNO}"))
+
+    def test_rejects_unsafe_or_oversized_serial_numbers(self):
+        for value in ("", "-starts-with-dash", "has space", "x" * 129):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(BuildError, "invalid device serial"):
+                    MODULE["checked_serialno"](value)
+        self.assertEqual(MODULE["checked_serialno"](SERIALNO), SERIALNO)
+
+    def test_cli_requires_an_explicit_serial_number(self):
+        argument_parser = MODULE["parser"](MODULE["load_sources"]())
+        serial_action = next(
+            action
+            for action in argument_parser._actions
+            if action.dest == "serialno"
+        )
+        self.assertTrue(serial_action.required)
+        arguments = argument_parser.parse_args(
+            [
+                "--serialno",
+                SERIALNO,
+                "--vg-uuid",
+                VG_UUID,
+                "--pv-partuuid",
+                PARTUUID,
+            ]
+        )
+        self.assertEqual(arguments.serialno, SERIALNO)
 
     def test_extracts_complete_android_v2_cmdline_and_rejects_padding(self):
         cmdline = BASE_CMDLINE + " " + "x" * 700
@@ -133,12 +177,14 @@ class BoundPocketBootTests(unittest.TestCase):
             output_name="pocketboot-sargo-lvm-bound-noacm.img",
             vg_uuid=VG_UUID,
             partuuids=[PARTUUID],
+            serialno=SERIALNO,
             patches=MODULE["patch_records"](),
         )
         value = json.loads(data)
         self.assertEqual(value["format"], "org.frankensargo.pocketboot-bound-image/1")
         self.assertEqual(value["binding"]["vg_uuid"], VG_UUID)
         self.assertEqual(value["binding"]["pv_partuuids"], [PARTUUID])
+        self.assertEqual(value["binding"]["serialno"], SERIALNO)
         self.assertEqual(value["pocketboot"]["base_patched_tree"], "b" * 40)
         self.assertEqual(value["pocketboot"]["bound_tree"], "c" * 40)
         self.assertEqual(

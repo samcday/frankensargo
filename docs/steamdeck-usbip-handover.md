@@ -438,8 +438,10 @@ is not an artifact. The profile leaves the source tree unchanged and proves
 its artifact differs from the parent image only within the two Android-v2
 cmdline fields. Do not hand-edit the Sargo TOML or reuse the historical
 `b542`/`fc3a32d` control as mutation-capable evidence. Once the VG exists, use
-`bin/build-pocketboot-bound --no-acm` so the transport profile and observed
-storage binding are composed in one restored, provenance-recorded build.
+`bin/build-pocketboot-bound --no-acm` with
+`--serialno <EXACT_OBSERVED_SARGO_SERIAL>` so the transport profile, exact
+observed serial, and storage binding are composed in one restored,
+provenance-recorded build.
 
 That current 0001-through-0013 no-ACM bundle has now been built and verified
 on `sam-desktop` under ignored workspace output
@@ -454,3 +456,10 @@ builder tests, full PocketBoot 188-test suite, and xtask 28-test suite pass.
 This bundle has not yet been transferred to the sleeping Deck or booted on
 Frankensargo; its USB and hardware `shell_v2` behavior therefore remain the
 next qualification, not an inferred success.
+
+That generic-bundle checkpoint is historical. On 2026-07-13, a later bound
+0001-through-0014 no-ACM image with SHA-256 `988ba0fb…` successfully discovered
+PocketBlue's XBOOTLDR LV and booted its LVM-backed Fedora deployment. This does
+not retroactively qualify large USB reads or mutation-controller `shell_v2`;
+the exact result is recorded in the
+[PocketBlue sdm670 LVM runbook](pocketblue-sdm670-lvm.md).

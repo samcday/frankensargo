@@ -6,8 +6,9 @@ Type #1 BLS entry, and a Btrfs root filesystem. It deliberately contains no
 ABlx, `qbootctl`, direct-ABL deployment, or writes to Android `boot_a` or
 `boot_b`.
 
-The image is prepared and its storage/initrd contract is verified. Hardware
-boot remains unproved while frankensargo is offline.
+On 2026-07-13 this image booted successfully from three LVs on frankensargo
+`99NAY1AZG1`. PocketBoot discovered its BLS entry on XBOOTLDR, and the
+downstream Fedora deployment reached UART getty with working Magic SysRq.
 
 ## Source and build
 
@@ -24,6 +25,8 @@ The PocketBlue branch is pushed to `samcday/pocketblue` at these commits:
 fdadf85 sdm670: add loader-neutral sargo image
 d8400f2 sdm670: enable droid-juicer repository
 277778e ci: keep disk images on mount-capable arm runner
+739979f sdm670: document all LVM activation requests
+d058d19 sdm670: install dynamic partition mapper
 ```
 
 Container run `29215523419` built the real sdm670 image successfully. Disk run
@@ -38,20 +41,17 @@ The raw GitHub artifact is 1,614,039,303 bytes:
 df610c73b4cf6a84d22aa907476bdb144d0fb44017f5b6c44500cae64a0ae07c  pocketblue-sdm670-google-sargo-tty-rawhide-sdm670-frankensargo.7z
 ```
 
-The currently staged inputs are:
+The imported inputs are:
 
-| Image | Bytes | Filesystem UUID | Current SHA-256 |
+| Image | Bytes | Filesystem UUID | SHA-256 |
 |---|---:|---|---|
 | `fedora_esp.raw` | 268,435,456 | `7FD8-FC69` | `19a05d85d8a26bf223e945e7dd8b54dd3e661ac69362e63328a37f2b368bf225` |
-| `fedora_boot.raw` | 1,073,741,824 | `da6c5411-07c8-4228-a261-8ff0c478b650` | `93b9c27ab989a1ccba1a9c47cbc19d9aa88fae53ecb88fc1810c0624eeeaafd9` |
+| `fedora_boot.raw` | 1,073,741,824 | `da6c5411-07c8-4228-a261-8ff0c478b650` | `6789ed1a710e7b63e5b73aea6c5dedc22c9d1bd3696da9506c8597403b8c8fd2` |
 | `fedora_rootfs.raw` | 9,137,274,880 | `dbaf8d57-2ac8-4a8d-a621-4a493851c348` | `6845c540f146c41dadeb493ec5117401cbec5b109a1b9213490335a41eb0eec8` |
 
 The XBOOTLDR image passed `e2fsck -fn`. The root image is Btrfs with the BLS
-entry's `rootflags=subvol=/root`. The staged XBOOTLDR hash above includes the
-root and XBOOTLDR LVM arguments, but predates the final ESP activation argument.
-It is an audit checkpoint, not the hash to publish. Before import, add
-`rd.lvm.lv=franken/pocketblue-esp`, rerun `e2fsck -fn`, and record the new final
-XBOOTLDR hash.
+entry's `rootflags=subvol=/root`. The staged XBOOTLDR hash above is final and
+includes exact activation arguments for root, XBOOTLDR, and ESP.
 
 ## Why the small LVM override works
 
@@ -108,69 +108,82 @@ launch path while retaining the on-device menu. If a later image contains
 multiple entries, it should add `default ostree-1.conf` to
 `loader/loader.conf` before its final image hash is recorded.
 
-## Current safe checkpoint
+## Verified hardware result
 
-The owned VG remains `franken` on the userdata-anchor PV. Three thick LVs were
-created before frankensargo was unplugged:
+The three source images were copied into thick LVs, synced, and independently
+read back with the exact SHA-256 values in the table above. Staging mappings
+were then deactivated before publication. The observed LV identities are:
 
-| LV | Size | Current role |
-|---|---:|---|
-| `pocketblue-esp` | 256 MiB | untagged for PocketBoot; contains a truncated failed first transfer |
-| `pocketblue-xbootldr` | 1,024 MiB | unpublished; `pocketboot.bootfs.v1` was removed before import |
-| `pocketblue-root` | 8,716 MiB | unpublished |
+| LV | Size | LV UUID | Observed downstream use |
+|---|---:|---|---|
+| `pocketblue-esp` | 256 MiB | `cCKrT3-jw0s-K6mv-oazS-4M58-4NQv-jcb2Np` | vfat at `/boot/efi` (rw) |
+| `pocketblue-xbootldr` | 1,024 MiB | `Ye4q2D-QYao-k25n-Yoio-hTis-y1Of-06dQ9h` | ext4 at `/boot` (ro) |
+| `pocketblue-root` | 8,716 MiB | `eS20xg-PD3X-faNX-36DH-t8wP-zxvE-Gs0R1i` | Btrfs OSTree backing |
 
-All retain `distro.pocketblue` and `greygoo.replaceable`. No filesystem image
-is currently published to PocketBoot, and no GPT partition or Android boot
-partition was changed. The interrupted transfer coincided with a Deck hub-wide
-USB `-71` reset that removed both PocketBoot and the FTDI UART; it was detected
-by a failed destination hash.
+`lsblk` showed the root mapper backing `/sysroot`,
+`/sysroot/ostree/deploy/default/var`, `/var`, and `/etc`. The deployed `/`
+reports `composefs`; it is therefore deliberately not described as a direct
+mount of the root LV. All LVs retain
+`distro.pocketblue,greygoo.replaceable`, but only XBOOTLDR carries
+`pocketboot.bootfs.v1`.
 
-While dev-sargo is attached to the Deck, issue no USB, ADB, fastboot, UART, or
-block-device command. Resume only after the user explicitly says frankensargo
-is back and exact serial `99NAY1AZG1` is present.
+The successful no-ACM bound PocketBoot image is 7,864,320 bytes with SHA-256:
 
-## Resume the import
-
-Run the writer inside Deck's `fedora-latest` distrobox. It verifies the complete
-source hash first, compares every 64 MiB destination chunk, skips matches, and
-retries an interrupted chunk up to 20 times. A larger LV is never truncated.
-
-```sh
-cd /home/deck/frankensargo-pocketblue
-
-./write-lv-resumable 99NAY1AZG1 \
-  images/fedora_esp.raw \
-  /dev/mapper/franken-pocketblue--esp \
-  19a05d85d8a26bf223e945e7dd8b54dd3e661ac69362e63328a37f2b368bf225
-
-./write-lv-resumable 99NAY1AZG1 \
-  images/fedora_boot.raw \
-  /dev/mapper/franken-pocketblue--xbootldr \
-  FINAL_BOOT_SHA256_AFTER_ESP_ACTIVATION_EDIT
-
-./write-lv-resumable 99NAY1AZG1 \
-  images/fedora_rootfs.raw \
-  /dev/mapper/franken-pocketblue--root \
-  6845c540f146c41dadeb493ec5117401cbec5b109a1b9213490335a41eb0eec8
+```text
+988ba0fb069f1dc6ae88c0267f6ccd267090da2acf5ef942d1da9bfe2e4df06c  pocketboot-sargo-lvm-bound-noacm.img
 ```
 
-Only after all three commands finish, add `pocketboot.bootfs.v1` to
-`franken/pocketblue-xbootldr`, deactivate the three staging mappings, and reset
-frankensargo so PocketBoot performs a fresh tagged-LV discovery. The ESP LV
-stays untagged; it is retained to preserve PocketBlue's conventional update
-layout.
-
-Start a persistent UART capture before resetting. Once PocketBoot logs the
-`ostree-1.conf` entry and completes discovery, launch it with:
+Bound builds now require the exact observed serial as well as the storage
+identity; this preserves `androidboot.serialno` across a PocketBoot self-kexec:
 
 ```sh
-fastboot -s 99NAY1AZG1 continue
+bin/build-pocketboot-bound --no-acm \
+  --serialno 99NAY1AZG1 \
+  --vg-uuid 8Lobll-Ri4f-ilPQ-ptQh-Qmz7-xYSe-2Yo006 \
+  --pv-partuuid db04e713-11c3-4d68-bec2-8cc483bd3891 \
+  --kernel-tree "$PWD/.work/linux-sdm670-pinned" \
+  --output-dir out/pocketboot-bound-franken-0014-serial
 ```
 
-If a DRM panic QR appears, preserve the screen and UART log for capture before
-issuing any reset.
+The first read-only discovery exposed LVM's JSON `lv_active=-1` sentinel.
+PocketBoot patch `0014-accept-readonly-unknown-lv-active.patch` accepts that
+unknown state while retaining the independent sysfs fence against pre-existing
+device-mapper mappings. With that patch, PocketBoot activated only the tagged
+XBOOTLDR LV read-only and discovered `ostree-1.conf`.
 
-Completion requires UART evidence from the downstream kernel showing the
-prepared command line, successful activation and mount of
-`franken/pocketblue-root`, a reached tty/getty, and working Magic SysRq. Until
-those observations exist this bring-up is prepared, not boot-proven.
+After `fastboot -s 99NAY1AZG1 continue`, the downstream command line contained
+exactly one activation request for each filesystem and retained recovery:
+
+```text
+rd.lvm.lv=franken/pocketblue-root
+rd.lvm.lv=franken/pocketblue-xbootldr
+rd.lvm.lv=franken/pocketblue-esp
+console=tty0 console=ttyMSM0,115200n8
+sysrq_always_enabled=1
+```
+
+UART then proved active `serial-getty@ttyMSM0.service` and
+`systemd-homed.service`. Sending a BREAK followed by `h` produced the kernel
+SysRq help text without resetting the phone. This completes the first
+root-on-LVM, PocketBoot-to-PocketBlue boot proof; no Android GPT or
+`boot_a`/`boot_b` partition was changed.
+
+The booted deployment reported image
+`ghcr.io/samcday/sdm670-google-sargo-tty:rawhide-sdm670-frankensargo`, digest
+`sha256:a012a6523634a7c383cf70a27f3a3581adeb9ad0f56939f821b1553133fb8f90`,
+and version `45.20260712.0`.
+
+## Known non-blocking issues
+
+- PocketBoot emits FunctionFS teardown WARNs while handing USB over for kexec;
+  they did not prevent discovery or the downstream boot.
+- `droid-juicer.service` is degraded because
+  `make-dynpart-mappings@system_a.service` and
+  `make-dynpart-mappings@system_b.service` are absent, ending in `Failed to map
+  super partition`. Commit `d058d19` installs the missing
+  `make-dynpart-mappings` package for the next image; this booted image predates
+  that fix.
+- Consequently the extracted Android firmware is unavailable: modem remoteproc
+  cannot load `qcom/sdm670/sargo/mba.mbn`, while the GPU cannot load
+  `qcom/sdm670/sargo/a615_zap.mbn` and hardware initialization fails. These are
+  distro integration gaps, not failures of the LVM boot path.
