@@ -38,16 +38,20 @@ The raw GitHub artifact is 1,614,039,303 bytes:
 df610c73b4cf6a84d22aa907476bdb144d0fb44017f5b6c44500cae64a0ae07c  pocketblue-sdm670-google-sargo-tty-rawhide-sdm670-frankensargo.7z
 ```
 
-After the last-mile BLS edit, its inputs are:
+The currently staged inputs are:
 
-| Image | Bytes | Filesystem UUID | SHA-256 |
+| Image | Bytes | Filesystem UUID | Current SHA-256 |
 |---|---:|---|---|
 | `fedora_esp.raw` | 268,435,456 | `7FD8-FC69` | `19a05d85d8a26bf223e945e7dd8b54dd3e661ac69362e63328a37f2b368bf225` |
 | `fedora_boot.raw` | 1,073,741,824 | `da6c5411-07c8-4228-a261-8ff0c478b650` | `93b9c27ab989a1ccba1a9c47cbc19d9aa88fae53ecb88fc1810c0624eeeaafd9` |
 | `fedora_rootfs.raw` | 9,137,274,880 | `dbaf8d57-2ac8-4a8d-a621-4a493851c348` | `6845c540f146c41dadeb493ec5117401cbec5b109a1b9213490335a41eb0eec8` |
 
 The XBOOTLDR image passed `e2fsck -fn`. The root image is Btrfs with the BLS
-entry's `rootflags=subvol=/root`.
+entry's `rootflags=subvol=/root`. The staged XBOOTLDR hash above includes the
+root and XBOOTLDR LVM arguments, but predates the final ESP activation argument.
+It is an audit checkpoint, not the hash to publish. Before import, add
+`rd.lvm.lv=franken/pocketblue-esp`, rerun `e2fsck -fn`, and record the new final
+XBOOTLDR hash.
 
 ## Why the small LVM override works
 
@@ -72,15 +76,16 @@ so placing that filesystem directly in an LV does not require changing
 ```text
 rd.lvm.lv=franken/pocketblue-root
 rd.lvm.lv=franken/pocketblue-xbootldr
+rd.lvm.lv=franken/pocketblue-esp
 ```
 
-The second request makes `/boot` available after the downstream kernel starts;
-PocketBoot's own device-mapper activation does not survive kexec. This is the
-portable distro-side proposal: include dracut's stock `lvm` module and `lvm2`
-userspace, keep filesystem-UUID roots, and let the deployment/loader supply the
-site-specific `rd.lvm.lv=` arguments. The argument is LV-name-bound, not
-VG-UUID-bound; a future manifest-aware PocketBoot policy can add stronger
-identity checks before constructing it.
+The latter two requests make `/boot` and `/boot/efi` independent of a later
+udev autoactivation pass; PocketBoot's own device-mapper activation does not
+survive kexec. This is the portable distro-side proposal: include dracut's
+stock `lvm` module and `lvm2` userspace, keep filesystem-UUID roots, and let the
+deployment/loader supply the site-specific `rd.lvm.lv=` arguments. The
+argument is LV-name-bound, not VG-UUID-bound; a future manifest-aware
+PocketBoot policy can add stronger identity checks before constructing it.
 
 The prepared BLS entry also replaces the generic `ttyS0` with sargo's UART and
 enables downstream recovery:
@@ -92,6 +97,16 @@ sysrq_always_enabled=1
 
 Its kernel, initramfs, and `fdtdir` all live below the XBOOTLDR filesystem, so
 PocketBoot does not need the ESP to launch it.
+
+The hash-bound XBOOTLDR currently has one entry, `ostree-1.conf`, and no
+`loader.conf`. PocketBoot sorts XBOOTLDR ahead of ESP and nested-disk entries;
+the literal PocketBlue options contain no unresolved `$kernelopts`, so this
+sole entry is eligible for automatic boot. After discovery, an exact-serial
+`fastboot continue` exits PocketBoot's fastboot server and boots the first
+automatic entry. This gives this first-pass image a deterministic no-touch
+launch path while retaining the on-device menu. If a later image contains
+multiple entries, it should add `default ostree-1.conf` to
+`loader/loader.conf` before its final image hash is recorded.
 
 ## Current safe checkpoint
 
@@ -131,7 +146,7 @@ cd /home/deck/frankensargo-pocketblue
 ./write-lv-resumable 99NAY1AZG1 \
   images/fedora_boot.raw \
   /dev/mapper/franken-pocketblue--xbootldr \
-  93b9c27ab989a1ccba1a9c47cbc19d9aa88fae53ecb88fc1810c0624eeeaafd9
+  FINAL_BOOT_SHA256_AFTER_ESP_ACTIVATION_EDIT
 
 ./write-lv-resumable 99NAY1AZG1 \
   images/fedora_rootfs.raw \
@@ -144,6 +159,16 @@ Only after all three commands finish, add `pocketboot.bootfs.v1` to
 frankensargo so PocketBoot performs a fresh tagged-LV discovery. The ESP LV
 stays untagged; it is retained to preserve PocketBlue's conventional update
 layout.
+
+Start a persistent UART capture before resetting. Once PocketBoot logs the
+`ostree-1.conf` entry and completes discovery, launch it with:
+
+```sh
+fastboot -s 99NAY1AZG1 continue
+```
+
+If a DRM panic QR appears, preserve the screen and UART log for capture before
+issuing any reset.
 
 Completion requires UART evidence from the downstream kernel showing the
 prepared command line, successful activation and mount of
