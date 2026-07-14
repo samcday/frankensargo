@@ -1,0 +1,10 @@
+diff --git a/configs/device/qcom/sdm670-google-sargo.toml b/configs/device/qcom/sdm670-google-sargo.toml
+index 7916dba5c599a214307dd69087d5c440ac003953..3d1041ae6358e3a83e777320994b64a4eb194f89 100644
+--- a/configs/device/qcom/sdm670-google-sargo.toml
++++ b/configs/device/qcom/sdm670-google-sargo.toml
+@@ -21,4 +21,4 @@ ramdisk_offset = 0x01000000
+ second_offset = 0x00f00000
+ tags_offset = 0x00000100
+ dtb_offset = 0x01100000
+-cmdline = "pocketboot.log=debug pocketboot.acm"
++cmdline = "pocketboot.log=debug pocketboot.acm sysrq_always_enabled=1"

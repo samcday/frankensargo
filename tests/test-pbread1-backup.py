@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -253,6 +254,28 @@ class ResumeTests(Fixture):
         resumed = pbread1.execute_backup(run_dir, resumed_manifest, pbread1.OfflineTransport(self.source))
         self.assertEqual((resumed.downloaded_chunks, resumed.skipped_chunks), (0, 3))
         self.assertEqual(pbread1.verify_run(run_dir), first.raw_sha256)
+
+    def test_backup_tree_is_private_and_insecure_run_or_lock_is_rejected(self) -> None:
+        run_dir = self.root / "private-run"
+        pbread1.execute_backup(run_dir, self.manifest(), pbread1.OfflineTransport(self.source))
+        self.assertEqual(stat.S_IMODE(run_dir.lstat().st_mode), 0o700)
+        for path in run_dir.rglob("*"):
+            expected = 0o700 if path.is_dir() else 0o600
+            self.assertEqual(stat.S_IMODE(path.lstat().st_mode), expected, path)
+
+        insecure = self.root / "insecure-run"
+        insecure.mkdir(mode=0o755)
+        with self.assertRaisesRegex(pbread1.BackupError, "mode 0700"):
+            pbread1.execute_backup(
+                insecure, self.manifest(), pbread1.OfflineTransport(self.source)
+            )
+
+        symlinked = self.root / "symlinked-lock"
+        symlinked.mkdir(mode=0o700)
+        (symlinked / ".lock").symlink_to(self.source)
+        with self.assertRaisesRegex(pbread1.BackupError, "cannot open backup run lock"):
+            with pbread1.run_lock(symlinked, exclusive=False):
+                self.fail("symlinked PBREAD lock was accepted")
 
     def test_corrupt_chunk_is_quarantined_and_recaptured(self) -> None:
         run_dir = self.root / "run"

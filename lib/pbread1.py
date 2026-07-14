@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -521,11 +522,43 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def private_directory(path: Path, *, create: bool = True) -> None:
+    """Require an invoking-user-owned 0700 directory without symlink tricks."""
+
+    if create:
+        try:
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as error:
+            raise BackupError(f"cannot create private backup directory {path}: {error}") from error
+    try:
+        status = path.lstat()
+    except OSError as error:
+        raise BackupError(f"cannot inspect private backup directory {path}: {error}") from error
+    if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+        raise BackupError(f"backup directory is not a real directory: {path}")
+    if status.st_uid != os.geteuid():
+        raise BackupError(f"backup directory is not owned by the invoking user: {path}")
+    if stat.S_IMODE(status.st_mode) != 0o700:
+        raise BackupError(f"backup directory must have mode 0700: {path}")
+
+
+def private_output(path: Path) -> BinaryIO:
+    """Create one new 0600 output without following an existing path."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise BackupError(f"cannot create private backup artifact {path}: {error}") from error
+    return os.fdopen(descriptor, "wb")
+
+
 def atomic_write(path: Path, contents: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    private_directory(path.parent)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
     try:
-        with temporary.open("xb") as output:
+        with private_output(temporary) as output:
             output.write(contents)
             output.flush()
             os.fsync(output.fileno())
@@ -611,22 +644,36 @@ def write_journal(run_dir: Path, journal: dict[str, object]) -> None:
 @contextlib.contextmanager
 def run_lock(run_dir: Path, *, exclusive: bool) -> Iterator[None]:
     if exclusive:
-        run_dir.mkdir(parents=True, exist_ok=True)
-    elif not run_dir.is_dir():
-        raise BackupError(f"backup run directory does not exist: {run_dir}")
+        private_directory(run_dir)
+    else:
+        private_directory(run_dir, create=False)
     lock_path = run_dir / ".lock"
-    mode = "a+b" if exclusive else "rb"
+    flags = os.O_RDWR if exclusive else os.O_RDONLY
+    flags |= os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    if exclusive:
+        flags |= os.O_CREAT
     try:
-        lock = lock_path.open(mode)
+        descriptor = os.open(lock_path, flags, 0o600)
     except FileNotFoundError as error:
         raise BackupError(f"backup run lock is missing: {lock_path}") from error
-    with lock:
+    except OSError as error:
+        raise BackupError(f"cannot open backup run lock {lock_path}: {error}") from error
+    try:
+        lock_status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(lock_status.st_mode)
+            or lock_status.st_uid != os.geteuid()
+            or stat.S_IMODE(lock_status.st_mode) != 0o600
+        ):
+            raise BackupError("backup run lock must be an invoking-user-owned 0600 regular file")
         operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         try:
-            fcntl.flock(lock.fileno(), operation | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise BackupError(f"another PBREAD1 operation holds {lock_path}") from error
         yield
+    finally:
+        os.close(descriptor)
 
 
 def validate_header(header: Header, binding: PartitionBinding, offset: int, length: int, flags: int) -> None:
@@ -685,8 +732,8 @@ def extract_envelope(
     output: BinaryIO | None = None
     try:
         if destination is not None:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            output = destination.open("xb")
+            private_directory(destination.parent)
+            output = private_output(destination)
         with envelope.open("rb") as source:
             source.seek(HEADER_BYTES)
             remaining = header.payload_bytes
@@ -850,11 +897,11 @@ class OfflineTransport(Transport):
             )
 
     def stage_range(self, binding: PartitionBinding, offset: int, length: int, destination: Path) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        private_directory(destination.parent)
         with contextlib.suppress(FileNotFoundError):
             destination.unlink()
         digest = hashlib.sha256()
-        with destination.open("xb") as output, self.source.open("rb") as source:
+        with private_output(destination) as output, self.source.open("rb") as source:
             output.write(bytes(HEADER_BYTES))
             source.seek(offset)
             remaining = length
@@ -905,7 +952,7 @@ def quarantine(run_dir: Path, path: Path, reason: str) -> None:
     if not path.exists():
         return
     rejected = run_dir / "rejected"
-    rejected.mkdir(parents=True, exist_ok=True)
+    private_directory(rejected)
     destination = rejected / f"{path.name}.{utc_now().replace(':', '')}.{uuid.uuid4().hex[:8]}"
     os.replace(path, destination)
     fsync_directory(path.parent)
@@ -963,8 +1010,8 @@ def capture_chunks(
     downloaded = 0
     skipped = 0
     downloads = run_dir / ".downloads"
-    downloads.mkdir(parents=True, exist_ok=True)
-    (run_dir / "chunks").mkdir(parents=True, exist_ok=True)
+    private_directory(downloads)
+    private_directory(run_dir / "chunks")
 
     for index, (offset, length) in enumerate(chunks):
         key = chunk_key(index)
@@ -1059,7 +1106,7 @@ def assemble_raw(
     streaming_digest = hashlib.sha256()
     written = 0
     try:
-        with temporary.open("xb") as output:
+        with private_output(temporary) as output:
             for index, (_, length, digest) in enumerate(verified):
                 path = chunk_path(run_dir, index)
                 chunk_digest = hashlib.sha256()
@@ -1106,7 +1153,7 @@ def verify_source(
 ) -> str:
     binding = PartitionBinding.from_manifest(manifest)
     record = run_dir / ".downloads" / "source-hash.pbr.part"
-    record.parent.mkdir(parents=True, exist_ok=True)
+    private_directory(record.parent)
     try:
         transport.stage_hash(binding, record)
         source_digest = extract_envelope(

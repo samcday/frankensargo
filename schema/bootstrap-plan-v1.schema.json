@@ -202,8 +202,7 @@
           "const": "userdata"
         },
         "kernel_name_observation": {
-          "type": "string",
-          "pattern": "^mmcblk[0-9]+p[1-9][0-9]*$"
+          "const": "mmcblk0p72"
         },
         "start_lba": {
           "$ref": "#/$defs/positiveDecimal"

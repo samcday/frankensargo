@@ -2,9 +2,10 @@
 
 This records the 2026-07-11 USB/IP experiment and the preferred 2026-07-12
 Deck-local path from `sam-desktop` to frankensargo through `steamdeck`.
-`userdata` was never mounted or written. The sole persistent phone-side change
-in the direct-cable work was an explicit `set_active a`, which reset A/B
-boot-control metadata; no boot image or partition payload was flashed.
+`userdata` was never mounted or written. The only persistent phone-side changes
+in the direct-cable work were three explicit `set_active a` operations across
+the recovery sessions, which reset A/B boot-control metadata; no boot image or
+partition payload was flashed.
 
 ## Topology and identities
 
@@ -120,7 +121,8 @@ device unprivileged. The actual transient boot used official fastboot
 `76dde33fee8b1fd00bcaf2e7f94ddef6407f0beb5bc3a98a3d4127307af23f3a`,
 from the shared staging directory. It downloaded the verified 7,831,552-byte
 PocketBoot image and booted it without `flash` or `erase`; the preceding
-same-slot retry reset is the only boot-control mutation and is recorded above.
+same-slot retry reset was the only boot-control mutation in that run. Two
+later same-slot resets are recorded in the later control section below.
 
 Fedora's packaged `android-tools-35.0.2-17.fc44` is the preferred repeatable
 interface. Use the named-container form so noninteractive sessions do not
@@ -285,3 +287,179 @@ has occurred.
 
 Do not retry with both exports merely because they enumerate. Do not reboot or
 send SysRq to the phone as a remedy for a host-side VHCI/SCSI wedge.
+
+## Later direct-cable PBREAD boundary and recovery failure
+
+The later direct-cable work used image SHA-256
+`26c357405f551ec889ec2f5e759816a412cefd132cdc076ea856a5f64f5c1c2e`,
+patched PocketBoot tree
+`068cb8ef4b4203e367647abef5a594ff07c83d14`, and patches 0001 through
+0009. Its Android v2 command line
+contained `pocketboot.log=debug pocketboot.acm sysrq_always_enabled=1`.
+Patch 0009 made every configured UMS LUN read-only. UART independently confirmed
+serial `99NAY1AZG1`, slot `_a`, and retry count 2. This was the third and most
+recent same-slot retry reset; avoid another unless ABL genuinely refuses a
+transient boot.
+
+Small PBREAD responses worked, but the link had a sharp cumulative USB-IN
+boundary. Every test below read synthetic or real source bytes and wrote no
+phone block device:
+
+| Target/host control | Passing total bytes | First observed failure |
+|---|---:|---:|
+| Original PBREAD path | 1,024; 4,608; 16,896 | 33,280 (`EPROTO`) |
+| Host fastboot capped to 1 KiB usbfs reads | 16,384; 16,896; 17,408 | 24,576 (`EPROTO`) |
+| Experimental 64 KiB target AIO | — | 24,576 (`EPROTO`) |
+| ADB | 512 | one 16 KiB transfer |
+| Read-only kernel UMS | — | approximately 16 KiB |
+
+The 1 KiB host binary is retained at
+`/home/deck/frankensargo-lab/fastboot-1k/fastboot`, SHA-256
+`9a209ae867860c3e09d4a989476bde5ae590fa2ad93a704c185fcee34c08d58a`;
+that directory also contains its source, patch, RPM, and notes. Because the
+24,576-byte probe still failed with correctly capped host reads, host usbfs
+read size is falsified as the primary cause.
+
+The final failing probe exposed a deterministic target-side teardown deadlock.
+PocketBoot timed out after 30 seconds, while the ACM kernel-log forwarder still
+owned or reopened `/dev/ttyGS0`. UART SysRq task output showed PocketBoot in
+uninterruptible sleep at:
+
+```text
+gserial_free_port
+gserial_free_line
+acm_free_instance
+usb_put_function_instance
+configfs_rmdir
+```
+
+SysRq SAK worked but killed the only UART shell, and that image did not respawn
+its getty. PID 1 and the kernel remained alive, but USB fastboot/ADB/ACM were
+gone and no userspace recovery path remained. The target therefore requires a
+physical reset back to ABL before another control. Do not use SysRq immediate
+reboot for that transition: it may enter the active Android slot rather than
+ABL.
+
+Patch 0011 now stops and joins ADB, FunctionFS, and kmsg workers before
+configfs teardown, refuses removal unless tty closure is proven, bounds the
+teardown in a disposable worker, and gives PID 1 a respawning Rust getty
+supervisor. Patch 0012 adds `tx-fifo-resize` to the Sargo DWC3 node. Google’s
+shipping SDM670 tree carried that property, while the pinned tree did not;
+without it, DWC3 does not redistribute TX FIFO space for PocketBoot’s five IN
+endpoints. This is the strongest current initial-transfer hypothesis, distinct
+from the proven ACM teardown defect, and still requires a fresh-boot hardware
+comparison.
+
+The corresponding ACM-plus-FIFO-resize comparison image is staged at
+`/home/deck/frankensargo-lab/acm-txfifo-safe-teardown-fc3a32d/`. Its exact
+0001-through-0012 tree is
+`fc3a32d120f912c084621799f625b5c168e7b604`, the image SHA-256 is
+`4b628a5c442dac90caedbcda2a6dfb1955ed4a9205afb0be0a4de99645964c51`,
+and its parsed command line is exactly
+`pocketboot.log=debug pocketboot.acm sysrq_always_enabled=1`. The processed
+DTB contains one `tx-fifo-resize` property. The directory contains checksum,
+provenance, and independent verification files. These facts prove the build,
+not the USB hypothesis; use it for one fresh-boot comparison only.
+
+That fresh-boot comparison was completed from ABL. UART proved the exact image
+and command line, `sysrq: sysrq always enabled`, and ABL retry count 1. A
+PBREAD payload of `0x5e00` bytes produced a 24,576-byte staged envelope, then
+failed on `get_staged` with the same host `EPROTO` and target 30-second exact
+AIO timeout. DWC3 FIFO resizing alone therefore does not fix the initial
+USB-IN transfer failure.
+
+Patch 0011 did fix the recovery failure. It stopped and joined the kmsg, ADB
+and fastboot workers, closed `ttyGS0`, and completed configfs teardown instead
+of blocking in `gserial_free_port`. FunctionFS teardown emitted two kernel
+`__flush_work` warnings, which remain a defect to investigate, but there was no
+panic or D-state teardown. PID 1 entered its recovery hold with UART usable.
+An interactive `id` returned `uid=0 gid=0`; exiting that shell caused the PID
+1 supervisor to spawn a replacement getty one second later. No phone storage
+write occurred.
+
+An independently attested no-ACM control image is staged on the Deck at:
+
+```text
+/home/deck/frankensargo-lab/pocketboot-control-noacm/
+  pocketboot-sargo-lab-noacm-b542.img
+  pocketboot-sargo-lab-noacm-b542.img.sha256
+  pocketboot-sargo-lab-noacm-b542.img.provenance
+```
+
+Its SHA-256 is
+`f1e7f2e793f2a3ce6c7a7e868584720037e7867bebc2d397bbe0f8e7e05b294f`,
+and its parsed Android v2 command line is exactly
+`pocketboot.log=debug sysrq_always_enabled=1`. It differs from the prior
+0001-through-0008 source tree only by removing `pocketboot.acm`. Use each
+matrix image only once from a fresh ABL boot; the first `EPROTO` can poison
+endpoint state and invalidate subsequent comparisons.
+
+Prefer its later safe-teardown successor for the actual no-ACM control:
+
+```text
+/home/deck/frankensargo-lab/noacm-txfifo-safe-teardown-fc3a32d/
+  pocketboot-sargo-lab-noacm.img
+  pocketboot-sargo-lab-noacm.img.sha256
+  pocketboot-sargo-lab-noacm.img.provenance
+  pocketboot-sargo-lab-noacm.img.verification
+```
+
+That image is 7,856,128 bytes with SHA-256
+`3e5fa16aac14624cec4a9034031eacab2e88b0081d59749c74444458b1357aa5`.
+It retains the exact 0001-through-0012 base, FIFO overlay, read-only UMS,
+bounded teardown and respawning getty; its only source delta from tree
+`fc3a32d120f912c084621799f625b5c168e7b604` removes `pocketboot.acm`, producing
+control tree `8cff350dd74cb5ee3d238085163a7171fdd69d85`. Its parsed command line is
+exactly `pocketboot.log=debug sysrq_always_enabled=1`.
+
+No DRM panic appeared during this failure. If a future run shows PocketBoot’s
+panic screen or compressed QR code, stop before resetting and photograph the
+entire display and QR. That evidence is more useful than another blind retry.
+
+Patch 0013 subsequently added the raw standard ADB `shell_v2` protocol and
+typed child exit status required by the takeover/import controllers. It is
+source- and host-test validated as exact patch-stack tree
+`fb96a55f631bc9ebd1dd7b0c97874fd9050201a9`; the patch SHA-256 is
+`bbad5706d31665c55dbe60088ae20e3d379addb6ad2eca87295f09ae429eaaa2`.
+It is not present in either staged comparison image above. Do not use those
+0001-through-0012 images for any command whose success would authorize a
+storage mutation; the next mutation-capable image must contain this exact
+0001-through-0013 tree and separately prove `shell_v2` with the nonce/status
+probe before controller preflight.
+
+Rebuild the next generic no-ACM control from that current patch stack with
+`bin/build-pocketboot --no-acm`. The reproducible outputs are
+`out/pocketboot-noacm/pocketboot-sargo-lab-noacm.img` plus `.sha256`,
+`.provenance`, `.profile.json`, and final `.bundle.json` sidecars. Require
+`python3 lib/pocketboot_bundle.py verify --manifest ...bundle.json`; the
+completion manifest is linked and directory-fsynced only after every other
+fresh-destination member is durable. A partial directory without that marker
+is not an artifact. The profile leaves the source tree unchanged and proves
+its artifact differs from the parent image only within the two Android-v2
+cmdline fields. Do not hand-edit the Sargo TOML or reuse the historical
+`b542`/`fc3a32d` control as mutation-capable evidence. Once the VG exists, use
+`bin/build-pocketboot-bound --no-acm` with
+`--serialno <EXACT_OBSERVED_SARGO_SERIAL>` so the transport profile, exact
+observed serial, and storage binding are composed in one restored,
+provenance-recorded build.
+
+That current 0001-through-0013 no-ACM bundle has now been built and verified
+on `sam-desktop` under ignored workspace output
+`out/pocketboot-0013-noacm-bundle/`. The image is 7,864,320 bytes with SHA-256
+`08ed581376cb5d95e6ffa9c3df575848e9240bafdeb39c1e66e6b2b0144a90a7`;
+its completion manifest SHA-256 is
+`793ed797ccb9904f81bddb28fb9958386fed7bbb1f5e72343fc099e58320d2cb`.
+Its parent ACM image is `20375ae6…`, and an independent byte comparison found
+exactly 37 changed bytes at zero-based span `[85,122)`, all inside the first
+Android-v2 cmdline field. The strict manifest verifier, profile tests, bound
+builder tests, full PocketBoot 188-test suite, and xtask 28-test suite pass.
+This bundle has not yet been transferred to the sleeping Deck or booted on
+Frankensargo; its USB and hardware `shell_v2` behavior therefore remain the
+next qualification, not an inferred success.
+
+That generic-bundle checkpoint is historical. On 2026-07-13, a later bound
+0001-through-0014 no-ACM image with SHA-256 `988ba0fb…` successfully discovered
+PocketBlue's XBOOTLDR LV and booted its LVM-backed Fedora deployment. This does
+not retroactively qualify large USB reads or mutation-controller `shell_v2`;
+the exact result is recorded in the
+[PocketBlue sdm670 LVM runbook](pocketblue-sdm670-lvm.md).

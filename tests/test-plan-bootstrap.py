@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -130,10 +131,19 @@ class PlanTests(unittest.TestCase):
         ] = "433"
         mutations.append(wrong_runtime_config)
 
+        wrong_kernel_node = copy.deepcopy(built_plan())
+        wrong_kernel_node["partition"]["kernel_name_observation"] = "mmcblk1p72"
+        mutations.append(wrong_kernel_node)
+
         for mutation in mutations:
             with self.subTest(mutation=mutations.index(mutation)):
                 with self.assertRaises(jsonschema.ValidationError):
                     validator.validate(mutation)
+
+    def test_planner_rejects_nonfixed_userdata_kernel_node(self) -> None:
+        changed = dataclasses.replace(evidence(), kernel_name="mmcblk1p72")
+        with self.assertRaisesRegex(planner.PlanError, "fixed mmcblk0p72"):
+            planner.build_plan(changed, OPERATION_UUID, PV_UUID)
 
     def test_runtime_artifacts_are_exact_prewrite_authority(self) -> None:
         transaction = built_plan()["transaction"]
@@ -343,8 +353,9 @@ class EvidenceLoaderTests(unittest.TestCase):
         self.inventory_path = self.root / "inventory.json"
         self.inventory_path.write_text("synthetic inventory\n")
         self.run = self.root / "pbread"
-        self.run.mkdir()
+        self.run.mkdir(mode=0o700)
         (self.run / ".lock").write_bytes(b"")
+        (self.run / ".lock").chmod(0o600)
         (self.run / "journal.json").write_text("synthetic journal\n")
         self.image = self.root / "pocketboot.img"
         self.image.write_bytes(b"synthetic pocketboot\n")

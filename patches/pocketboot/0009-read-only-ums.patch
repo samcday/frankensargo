@@ -1,0 +1,75 @@
+diff --git a/src/gadget.rs b/src/gadget.rs
+index 032c37b65f9cca18c534ac7878d0d6c13d85a957..e5d3643471fb7e8dc7a37f2e13eb66e37a410f5e 100644
+--- a/src/gadget.rs
++++ b/src/gadget.rs
+@@ -29,6 +29,7 @@ const CONFIG_DIR: &str = "configs/c.1";
+ const FUNCTIONS_DIR: &str = "functions";
+ const MASS_STORAGE_FUNCTION: &str = "mass_storage.pocketboot-ums";
+ const MASS_STORAGE_INQUIRY: &str = "pocketboot UMS";
++const MASS_STORAGE_READ_ONLY: &str = "1";
+ const MAX_UMS_LUNS: usize = 8;
+ 
+ pub(crate) type ThreadResult = io::Result<Option<PostResponseAction>>;
+@@ -403,7 +404,7 @@ fn create_extra_mass_storage_luns(function_dir: &Path) -> io::Result<()> {
+ }
+ 
+ fn configure_mass_storage_lun(lun_dir: &Path) -> io::Result<()> {
+-    fs::write(lun_dir.join("ro"), "0")?;
++    fs::write(lun_dir.join("ro"), MASS_STORAGE_READ_ONLY)?;
+     fs::write(lun_dir.join("cdrom"), "0")?;
+     fs::write(lun_dir.join("nofua"), "0")?;
+     fs::write(lun_dir.join("removable"), "1")?;
+@@ -500,3 +501,53 @@ fn wait_for_udc(timeout: Duration) -> io::Result<Udc> {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::{SystemTime, UNIX_EPOCH};
++
++    #[test]
++    fn configures_every_mass_storage_lun_read_only() {
++        let temp = TempDir::new();
++
++        configure_mass_storage_lun(&temp.path).unwrap();
++
++        assert_eq!(fs::read_to_string(temp.path.join("ro")).unwrap(), "1");
++        assert_eq!(fs::read_to_string(temp.path.join("cdrom")).unwrap(), "0");
++        assert_eq!(fs::read_to_string(temp.path.join("nofua")).unwrap(), "0");
++        assert_eq!(
++            fs::read_to_string(temp.path.join("removable")).unwrap(),
++            "1"
++        );
++        assert_eq!(
++            fs::read_to_string(temp.path.join("inquiry_string")).unwrap(),
++            MASS_STORAGE_INQUIRY
++        );
++    }
++
++    struct TempDir {
++        path: PathBuf,
++    }
++
++    impl TempDir {
++        fn new() -> Self {
++            let nonce = SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .unwrap()
++                .as_nanos();
++            let path = std::env::temp_dir().join(format!(
++                "pocketboot-gadget-test-{}-{nonce}",
++                std::process::id()
++            ));
++            fs::create_dir(&path).unwrap();
++            Self { path }
++        }
++    }
++
++    impl Drop for TempDir {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.path);
++        }
++    }
++}

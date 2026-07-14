@@ -1,0 +1,1160 @@
+diff --git a/src/gadget.rs b/src/gadget.rs
+index e5d3643..3cf0081 100644
+--- a/src/gadget.rs
++++ b/src/gadget.rs
+@@ -1,8 +1,8 @@
+ use std::{
+-    fs, io,
++    fs, io, mem,
+     os::unix::{ffi::OsStrExt, fs::symlink},
+     path::{Path, PathBuf},
+-    sync::{Arc, Mutex},
++    sync::{Arc, Mutex, mpsc},
+     thread,
+     time::Duration,
+ };
+@@ -18,6 +18,7 @@ use gadgetry_most_foul::{
+ use crate::{
+     adb,
+     fastboot::{self, PostResponseAction},
++    kmsg_forwarder,
+ };
+ 
+ const CONFIGFS: &str = "/sys/kernel/config";
+@@ -31,6 +32,8 @@ const MASS_STORAGE_FUNCTION: &str = "mass_storage.pocketboot-ums";
+ const MASS_STORAGE_INQUIRY: &str = "pocketboot UMS";
+ const MASS_STORAGE_READ_ONLY: &str = "1";
+ const MAX_UMS_LUNS: usize = 8;
++const KMSG_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
++const CONFIGFS_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+ 
+ pub(crate) type ThreadResult = io::Result<Option<PostResponseAction>>;
+ 
+@@ -129,6 +132,119 @@ impl GadgetFunction for adb::UsbFunction {
+     }
+ }
+ 
++#[derive(Default)]
++struct FastbootWorkers {
++    adb_server: Option<adb::ServerHandle>,
++    fastboot_events: Option<fastboot::EventLoop>,
++    adb_events: Option<adb::EventLoop>,
++    kmsg_forwarder: Option<kmsg_forwarder::Handle>,
++}
++
++struct WorkerShutdown {
++    tty_closed: bool,
++    errors: Vec<String>,
++}
++
++impl FastbootWorkers {
++    fn new(acm: bool) -> Self {
++        let kmsg_forwarder = if acm {
++            match kmsg_forwarder::spawn() {
++                Ok(handle) => Some(handle),
++                Err(err) => {
++                    tracing::warn!(error = ?err, "failed to spawn kmsg forwarder");
++                    None
++                }
++            }
++        } else {
++            None
++        };
++        Self {
++            adb_server: None,
++            fastboot_events: None,
++            adb_events: None,
++            kmsg_forwarder,
++        }
++    }
++
++    fn start(
++        &mut self,
++        fastboot_function: fastboot::UsbFunction,
++        adb_function: adb::UsbFunction,
++    ) -> io::Result<fastboot::FastbootServer> {
++        let (server, event_loop) = fastboot_function.start()?;
++        self.fastboot_events = Some(event_loop);
++
++        let (adb_server, event_loop) = adb_function.start()?;
++        self.adb_events = Some(event_loop);
++        self.adb_server = Some(adb_server.spawn()?);
++        Ok(server)
++    }
++
++    fn request_stop(&self) {
++        if let Some(server) = &self.adb_server {
++            server.stop();
++        }
++        if let Some(events) = &self.fastboot_events {
++            events.stop();
++        }
++        if let Some(events) = &self.adb_events {
++            events.stop();
++        }
++        if let Some(forwarder) = &self.kmsg_forwarder {
++            forwarder.request_stop();
++        }
++    }
++
++    fn shutdown(&mut self) -> WorkerShutdown {
++        self.request_stop();
++        let mut errors = Vec::new();
++
++        if let Some(server) = self.adb_server.take()
++            && let Err(err) = server.join()
++        {
++            errors.push(format!("adb server shutdown failed: {err}"));
++        }
++        if let Some(events) = self.fastboot_events.take() {
++            events.join();
++        }
++        if let Some(events) = self.adb_events.take() {
++            events.join();
++        }
++
++        let tty_closed = match self.kmsg_forwarder.take() {
++            None => true,
++            Some(forwarder) => {
++                let shutdown = forwarder.stop_and_join(KMSG_SHUTDOWN_TIMEOUT);
++                let tty_closed = shutdown.tty_closed();
++                match shutdown {
++                    kmsg_forwarder::Shutdown::Joined => {}
++                    kmsg_forwarder::Shutdown::Panicked => {
++                        errors.push("kmsg forwarder panicked during shutdown".to_string());
++                    }
++                    kmsg_forwarder::Shutdown::TimedOut => {
++                        errors.push(format!(
++                            "kmsg forwarder did not close ttyGS0 within {} ms",
++                            KMSG_SHUTDOWN_TIMEOUT.as_millis()
++                        ));
++                    }
++                }
++                tty_closed
++            }
++        };
++
++        WorkerShutdown { tty_closed, errors }
++    }
++}
++
++impl Drop for FastbootWorkers {
++    fn drop(&mut self) {
++        let shutdown = self.shutdown();
++        for error in shutdown.errors {
++            tracing::warn!(error, "USB worker cleanup failed while unwinding");
++        }
++    }
++}
++
+ impl Gadget {
+     pub(crate) fn new(serialno: impl Into<String>) -> Self {
+         Self {
+@@ -214,10 +330,14 @@ impl Gadget {
+         };
+         self.register_and_bind(config, true)?;
+ 
+-        let (server, event_loop) = fastboot_function.start()?;
+-        let (adb_server, adb_event_loop) = adb_function.start()?;
+-        let adb_handle = adb_server.spawn()?;
+-        let server_result = server.run();
++        // The worker owner exists before any FunctionFS thread is started, so
++        // every partial-start failure still stops all successfully-started
++        // workers and closes ttyGS0 before touching configfs.
++        let mut workers = FastbootWorkers::new(acm);
++        let server_result = match workers.start(fastboot_function, adb_function) {
++            Ok(server) => server.run(),
++            Err(err) => Err(err),
++        };
+         match &server_result {
+             Ok(action) => tracing::info!(
+                 has_action = action.is_some(),
+@@ -226,24 +346,21 @@ impl Gadget {
+             Err(err) => tracing::warn!(error = ?err, "fastboot server exited with error"),
+         }
+ 
+-        adb_handle.stop();
+-        event_loop.stop();
+-        adb_event_loop.stop();
+-        let unbind_result = self.unbind_and_remove();
+-        match &unbind_result {
+-            Ok(()) => tracing::info!("USB gadget unbound"),
+-            Err(err) => tracing::warn!(error = ?err, "USB gadget unbind failed"),
++        let worker_shutdown = workers.shutdown();
++        for error in &worker_shutdown.errors {
++            tracing::warn!(error, "USB worker shutdown failed");
+         }
+-
+-        if let Err(err) = adb_handle.join() {
+-            tracing::warn!(error = ?err, "adb server exited with error");
++        let teardown_result = guarded_configfs_teardown(
++            worker_shutdown.tty_closed,
++            || self.unbind_and_remove_bounded(CONFIGFS_TEARDOWN_TIMEOUT),
++            || self.quarantine_registered_gadget(),
++        );
++        match &teardown_result {
++            Ok(()) => tracing::info!("USB gadget teardown completed"),
++            Err(err) => tracing::warn!(error = ?err, "USB gadget teardown failed safely"),
+         }
+-        event_loop.join();
+-        adb_event_loop.join();
+ 
+-        let action = server_result?;
+-        unbind_result?;
+-        Ok(action)
++        combine_session_results(server_result, worker_shutdown.errors, teardown_result)
+     }
+ 
+     fn register_and_bind(&self, config: Config, include_mass_storage: bool) -> io::Result<()> {
+@@ -287,20 +404,129 @@ impl Gadget {
+         Ok(())
+     }
+ 
+-    fn unbind_and_remove(&self) -> io::Result<()> {
+-        let reg = {
++    fn take_registered_gadget(&self) -> Option<RegGadget> {
++        {
+             let mut state = self.state.lock().unwrap();
+             state.udc = None;
+             state.ums.clear();
+             state.reg.take()
+-        };
++        }
++    }
+ 
++    fn unbind_and_remove_bounded(&self, timeout: Duration) -> io::Result<()> {
++        let reg = self.take_registered_gadget();
+         let Some(reg) = reg else {
+             return Ok(());
+         };
+-        reg.bind(None)?;
+-        drop(reg);
+-        Ok(())
++        run_bounded_teardown(reg, timeout, |reg| {
++            reg.bind(None)?;
++            reg.remove()
++        })
++    }
++
++    fn quarantine_registered_gadget(&self) {
++        let Some(reg) = self.take_registered_gadget() else {
++            return;
++        };
++        let path = reg.path().display().to_string();
++        // A leaked registration is preferable to calling configfs_rmdir while
++        // a timed-out owner may still have ttyGS0 open. PID 1 remains alive,
++        // the physical UART/getty remains usable, and a reset can recover.
++        mem::forget(reg);
++        tracing::error!(path, "quarantined USB gadget without configfs removal");
++    }
++}
++
++fn combine_session_results(
++    server_result: ThreadResult,
++    worker_errors: Vec<String>,
++    teardown_result: io::Result<()>,
++) -> ThreadResult {
++    let action = server_result?;
++    if let Some(error) = worker_errors.into_iter().next() {
++        return Err(io::Error::other(error));
++    }
++    teardown_result?;
++    Ok(action)
++}
++
++fn guarded_configfs_teardown(
++    tty_closed: bool,
++    teardown: impl FnOnce() -> io::Result<()>,
++    quarantine: impl FnOnce(),
++) -> io::Result<()> {
++    if !tty_closed {
++        quarantine();
++        return Err(io::Error::new(
++            io::ErrorKind::TimedOut,
++            "refusing configfs teardown while ttyGS0 may still be open",
++        ));
++    }
++    teardown()
++}
++
++fn run_bounded_teardown<T, F>(resource: T, timeout: Duration, teardown: F) -> io::Result<()>
++where
++    T: Send + 'static,
++    F: FnOnce(T) -> io::Result<()> + Send + 'static,
++{
++    // Capacity one keeps handing the resource to the disposable worker
++    // non-blocking even if the scheduler has not run that thread yet.
++    let (work_tx, work_rx) = mpsc::sync_channel(1);
++    let (result_tx, result_rx) = mpsc::sync_channel(1);
++    let thread = match thread::Builder::new()
++        .name("pocketboot-gadget-teardown".to_string())
++        .spawn(move || {
++            let Ok(resource) = work_rx.recv() else {
++                return;
++            };
++            let _ = result_tx.send(teardown(resource));
++        }) {
++        Ok(thread) => thread,
++        Err(err) => {
++            // Do not drop a RegGadget on this thread when a teardown worker
++            // cannot be created: its destructor performs the same configfs
++            // rmdir that this isolation is designed to contain.
++            mem::forget(resource);
++            return Err(io::Error::new(
++                err.kind(),
++                format!("spawn isolated gadget teardown: {err}"),
++            ));
++        }
++    };
++
++    if let Err(mpsc::SendError(resource)) = work_tx.send(resource) {
++        mem::forget(resource);
++        return Err(io::Error::other(
++            "isolated gadget teardown worker exited before accepting work",
++        ));
++    }
++
++    match result_rx.recv_timeout(timeout) {
++        Ok(result) => {
++            if thread.join().is_err() {
++                return Err(io::Error::other("isolated gadget teardown thread panicked"));
++            }
++            result
++        }
++        Err(mpsc::RecvTimeoutError::Timeout) => {
++            // Dropping JoinHandle detaches only the disposable worker. Even if
++            // it is now in uninterruptible configfs sleep, PID 1 and its UART
++            // recovery services remain schedulable.
++            Err(io::Error::new(
++                io::ErrorKind::TimedOut,
++                format!(
++                    "isolated gadget teardown exceeded {} ms",
++                    timeout.as_millis()
++                ),
++            ))
++        }
++        Err(mpsc::RecvTimeoutError::Disconnected) => {
++            let _ = thread.join();
++            Err(io::Error::other(
++                "isolated gadget teardown exited without a result",
++            ))
++        }
+     }
+ }
+ 
+@@ -505,7 +731,59 @@ fn wait_for_udc(timeout: Duration) -> io::Result<Udc> {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use std::time::{SystemTime, UNIX_EPOCH};
++    use std::{
++        cell::RefCell,
++        time::{Instant, SystemTime, UNIX_EPOCH},
++    };
++
++    #[test]
++    fn configfs_teardown_requires_proof_that_tty_is_closed() {
++        let phases = RefCell::new(Vec::new());
++        let err = guarded_configfs_teardown(
++            false,
++            || {
++                phases.borrow_mut().push("configfs");
++                Ok(())
++            },
++            || phases.borrow_mut().push("quarantine"),
++        )
++        .unwrap_err();
++
++        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
++        assert_eq!(*phases.borrow(), ["quarantine"]);
++
++        phases.borrow_mut().clear();
++        guarded_configfs_teardown(
++            true,
++            || {
++                phases.borrow_mut().push("configfs");
++                Ok(())
++            },
++            || phases.borrow_mut().push("quarantine"),
++        )
++        .unwrap();
++        assert_eq!(*phases.borrow(), ["configfs"]);
++    }
++
++    #[test]
++    fn configfs_worker_timeout_is_bounded_for_pid1() {
++        let (release_tx, release_rx) = mpsc::channel();
++        let (done_tx, done_rx) = mpsc::channel();
++        let timeout = Duration::from_millis(25);
++        let start = Instant::now();
++
++        let err = run_bounded_teardown((), timeout, move |()| {
++            release_rx.recv().unwrap();
++            done_tx.send(()).unwrap();
++            Ok(())
++        })
++        .unwrap_err();
++
++        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
++        assert!(start.elapsed() < Duration::from_secs(1));
++        release_tx.send(()).unwrap();
++        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
++    }
+ 
+     #[test]
+     fn configures_every_mass_storage_lun_read_only() {
+diff --git a/src/getty.rs b/src/getty.rs
+index 0fe4889..7670751 100644
+--- a/src/getty.rs
++++ b/src/getty.rs
+@@ -1,17 +1,19 @@
+ use std::{
+     fs, io,
+-    process::{Command, Stdio},
++    process::{Child, Command, Stdio},
+     sync::atomic::{AtomicBool, Ordering},
++    thread,
++    time::Duration,
+ };
+ 
+ use crate::cmdline::KernelCommandLine;
+ 
+ const ACTIVE_CONSOLES: &str = "/sys/class/tty/console/active";
+ const DEFAULT_BAUD: &str = "115200";
+-const GETTY_SUPERVISOR: &str = "/bin/sh";
+-const GETTY_SUPERVISOR_SCRIPT: &str =
+-    "while true; do /sbin/getty -i -L -n -l /bin/sh \"$1\" \"$2\" linux; sleep 1; done";
++const GETTY: &str = "/sbin/getty";
+ const PATH: &str = "/bin:/sbin:/usr/bin:/usr/sbin";
++const GETTY_POLL_INTERVAL: Duration = Duration::from_millis(100);
++const GETTY_RESPAWN_DELAY: Duration = Duration::from_secs(1);
+ 
+ static STARTED: AtomicBool = AtomicBool::new(false);
+ 
+@@ -35,35 +37,105 @@ pub(crate) fn spawn(cmdline: &KernelCommandLine) {
+     }
+ 
+     for console in consoles {
+-        match spawn_console(&console) {
+-            Ok(pid) => tracing::info!(
+-                pid,
+-                tty = console.tty,
+-                baud = console.baud,
+-                "getty supervisor spawned"
+-            ),
++        let tty = console.tty.clone();
++        let baud = console.baud.clone();
++        match spawn_console(console) {
++            Ok(()) => tracing::info!(tty, baud, "PID 1 getty supervisor thread spawned"),
+             Err(err) => {
+-                tracing::warn!(tty = console.tty, baud = console.baud, error = ?err, "failed to spawn getty supervisor")
++                tracing::warn!(tty, baud, error = ?err, "failed to spawn PID 1 getty supervisor thread")
+             }
+         }
+     }
+ }
+ 
+-fn spawn_console(console: &Console) -> io::Result<u32> {
+-    let child = Command::new(GETTY_SUPERVISOR)
+-        .arg("-c")
+-        .arg(GETTY_SUPERVISOR_SCRIPT)
+-        .arg("pocketboot-getty")
++fn spawn_console(console: Console) -> io::Result<()> {
++    let thread_name = format!("pocketboot-getty-{}", console.tty);
++    thread::Builder::new()
++        .name(thread_name)
++        .spawn(move || supervise_console(console))?;
++    Ok(())
++}
++
++fn supervise_console(console: Console) {
++    supervise_console_with(
++        &console,
++        || true,
++        run_getty_once,
++        || thread::sleep(GETTY_RESPAWN_DELAY),
++    );
++}
++
++fn supervise_console_with(
++    console: &Console,
++    mut keep_running: impl FnMut() -> bool,
++    mut run_getty: impl FnMut(&Console) -> io::Result<()>,
++    mut respawn_delay: impl FnMut(),
++) {
++    while keep_running() {
++        if let Err(err) = run_getty(console) {
++            tracing::warn!(tty = console.tty, baud = console.baud, error = ?err, "getty exited with error")
++        }
++        respawn_delay();
++    }
++}
++
++fn run_getty_once(console: &Console) -> io::Result<()> {
++    let mut child = getty_command(console).spawn()?;
++    tracing::info!(
++        pid = child.id(),
++        tty = console.tty,
++        baud = console.baud,
++        "getty spawned"
++    );
++
++    match wait_for_getty(&mut child)? {
++        Some(status) => tracing::info!(
++            pid = child.id(),
++            tty = console.tty,
++            ?status,
++            "getty exited; supervisor will respawn it"
++        ),
++        None => tracing::info!(
++            pid = child.id(),
++            tty = console.tty,
++            "getty was reaped externally; supervisor will respawn it"
++        ),
++    }
++    Ok(())
++}
++
++fn getty_command(console: &Console) -> Command {
++    let mut command = Command::new(GETTY);
++    command
++        .arg("-i")
++        .arg("-L")
++        .arg("-n")
++        .arg("-l")
++        .arg("/bin/sh")
+         .arg(&console.baud)
+         .arg(&console.tty)
++        .arg("linux")
+         .env("HOME", "/")
+         .env("PATH", PATH)
+         .env("TERM", "linux")
+         .stdin(Stdio::null())
+         .stdout(Stdio::null())
+-        .stderr(Stdio::null())
+-        .spawn()?;
+-    Ok(child.id())
++        .stderr(Stdio::null());
++    command
++}
++
++fn wait_for_getty(child: &mut Child) -> io::Result<Option<std::process::ExitStatus>> {
++    loop {
++        match child.try_wait() {
++            Ok(Some(status)) => return Ok(Some(status)),
++            Ok(None) => thread::sleep(GETTY_POLL_INTERVAL),
++            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
++            // The PID-1 reaper may win the waitpid race. That still proves the
++            // child exited and must be respawned.
++            Err(err) if err.raw_os_error() == Some(libc::ECHILD) => return Ok(None),
++            Err(err) => return Err(err),
++        }
++    }
+ }
+ 
+ fn selected_consoles(cmdline: &KernelCommandLine, active: Option<&str>) -> Vec<Console> {
+@@ -160,6 +232,52 @@ struct Console {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use std::{cell::Cell, ffi::OsStr};
++
++    fn uart_console() -> Console {
++        Console {
++            tty: "ttyMSM0".to_string(),
++            baud: "115200".to_string(),
++        }
++    }
++
++    #[test]
++    fn launches_getty_directly_without_a_killable_shell_supervisor() {
++        let command = getty_command(&uart_console());
++        let args = command.get_args().collect::<Vec<_>>();
++
++        assert_eq!(command.get_program(), OsStr::new("/sbin/getty"));
++        assert_eq!(
++            args,
++            [
++                "-i", "-L", "-n", "-l", "/bin/sh", "115200", "ttyMSM0", "linux"
++            ]
++            .map(OsStr::new)
++        );
++    }
++
++    #[test]
++    fn pid1_owned_supervisor_retries_after_each_getty_exit() {
++        let attempts = Cell::new(0);
++        let delays = Cell::new(0);
++
++        supervise_console_with(
++            &uart_console(),
++            || attempts.get() < 2,
++            |_| {
++                attempts.set(attempts.get() + 1);
++                if attempts.get() == 1 {
++                    Err(io::Error::other("synthetic SAK exit"))
++                } else {
++                    Ok(())
++                }
++            },
++            || delays.set(delays.get() + 1),
++        );
++
++        assert_eq!(attempts.get(), 2);
++        assert_eq!(delays.get(), 2);
++    }
+ 
+     #[test]
+     fn uses_active_consoles_with_cmdline_baud_rates() {
+diff --git a/src/kmsg-forwarder.rs b/src/kmsg-forwarder.rs
+index 67e5cf7..b0bc151 100644
+--- a/src/kmsg-forwarder.rs
++++ b/src/kmsg-forwarder.rs
+@@ -3,6 +3,10 @@ use std::{
+     fs::File,
+     io::{self, Read, Seek, SeekFrom, Write},
+     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
++    sync::{
++        Arc,
++        atomic::{AtomicBool, Ordering},
++    },
+     thread,
+     time::{Duration, Instant},
+ };
+@@ -18,80 +22,158 @@ const KMSG_BACKLOG_MAX: usize = 512 * 1024;
+ const TTY_QUEUE_HIGH_WATER: usize = 4 * 1024;
+ const TTY_SETTLE_MS: u64 = 500;
+ const TTY_DTR_LOG_AFTER: Duration = Duration::from_secs(1);
++const STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+ 
+-pub(crate) fn spawn() {
+-    match thread::Builder::new()
+-        .name("pocketboot-kmsg-forwarder".to_string())
+-        .spawn(run)
+-    {
+-        Ok(_thread) => {
+-            tracing::info!(
+-                thread = "pocketboot-kmsg-forwarder",
+-                "kmsg forwarder thread spawned"
+-            )
++#[derive(Clone, Default)]
++struct StopSignal(Arc<AtomicBool>);
++
++impl StopSignal {
++    fn request(&self) {
++        self.0.store(true, Ordering::Release);
++    }
++
++    fn requested(&self) -> bool {
++        self.0.load(Ordering::Acquire)
++    }
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) enum Shutdown {
++    Joined,
++    Panicked,
++    TimedOut,
++}
++
++impl Shutdown {
++    pub(crate) fn tty_closed(&self) -> bool {
++        !matches!(self, Self::TimedOut)
++    }
++}
++
++pub(crate) struct Handle {
++    stop: StopSignal,
++    thread: Option<thread::JoinHandle<()>>,
++}
++
++impl Handle {
++    pub(crate) fn request_stop(&self) {
++        self.stop.request();
++    }
++
++    pub(crate) fn stop_and_join(mut self, timeout: Duration) -> Shutdown {
++        self.request_stop();
++        let deadline = Instant::now() + timeout;
++        let thread = self.thread.as_ref().expect("forwarder thread is present");
++        while !thread.is_finished() && Instant::now() < deadline {
++            thread::sleep(STOP_POLL_INTERVAL);
++        }
++        if !thread.is_finished() {
++            return Shutdown::TimedOut;
++        }
++
++        match self
++            .thread
++            .take()
++            .expect("forwarder thread is present")
++            .join()
++        {
++            Ok(()) => Shutdown::Joined,
++            Err(_) => Shutdown::Panicked,
+         }
+-        Err(err) => tracing::error!(error = ?err, "failed to spawn kmsg forwarder thread"),
+     }
+ }
+ 
+-fn run() {
+-    loop {
+-        if let Err(err) = forward_once() {
++impl Drop for Handle {
++    fn drop(&mut self) {
++        // Never leave an accidentally dropped handle asking the forwarder to
++        // reopen ttyGS0. Explicit teardown still uses stop_and_join so it can
++        // prove that the descriptor has actually closed.
++        self.request_stop();
++    }
++}
++
++pub(crate) fn spawn() -> io::Result<Handle> {
++    let stop = StopSignal::default();
++    let thread_stop = stop.clone();
++    let thread = thread::Builder::new()
++        .name("pocketboot-kmsg-forwarder".to_string())
++        .spawn(move || run(thread_stop))?;
++    tracing::info!(
++        thread = "pocketboot-kmsg-forwarder",
++        "kmsg forwarder thread spawned"
++    );
++    Ok(Handle {
++        stop,
++        thread: Some(thread),
++    })
++}
++
++fn run(stop: StopSignal) {
++    while !stop.requested() {
++        if let Err(err) = forward_once(&stop) {
++            if stop.requested() {
++                break;
++            }
+             tracing::warn!(error = ?err, "kmsg forwarder failed; retrying");
+-            thread::sleep(Duration::from_secs(1));
++            sleep_stoppable(&stop, Duration::from_secs(1));
+         }
+     }
++    tracing::debug!(tty = TTY_GS0, "kmsg forwarder stopped and tty closed");
+ }
+ 
+-fn forward_once() -> io::Result<()> {
++fn forward_once(stop: &StopSignal) -> io::Result<()> {
+     let mut kmsg = open_kmsg()?;
+     tracing::debug!(path = KMSG, "kmsg forwarder opened source");
+     let mut record = vec![0; KMSG_RECORD_MAX];
+     let mut backlog = Backlog::default();
+-    drain_kmsg_to_backlog(&mut kmsg, &mut backlog, &mut record)?;
++    drain_kmsg_to_backlog(stop, &mut kmsg, &mut backlog, &mut record)?;
+ 
+-    loop {
+-        let mut tty = match wait_for_tty(&mut kmsg, &mut backlog, &mut record) {
++    while !stop.requested() {
++        let mut tty = match wait_for_tty(stop, &mut kmsg, &mut backlog, &mut record) {
+             Ok(tty) => tty,
+             Err(err) if is_tty_disconnect(&err) => {
+                 tracing::info!(error = ?err, "kmsg forwarder tty disconnected while attaching");
+-                thread::sleep(Duration::from_millis(100));
++                sleep_stoppable(stop, Duration::from_millis(100));
+                 continue;
+             }
+             Err(err) => return Err(err),
+         };
+ 
+-        match forward_attached(&mut kmsg, &mut tty, &mut backlog, &mut record) {
+-            Ok(()) => unreachable!("attached kmsg forwarder loop should not exit"),
++        match forward_attached(stop, &mut kmsg, &mut tty, &mut backlog, &mut record) {
++            Ok(()) if stop.requested() => return Ok(()),
++            Ok(()) => continue,
+             Err(err) if is_tty_disconnect(&err) => {
+                 tracing::info!(error = ?err, "kmsg forwarder tty disconnected");
+             }
+             Err(err) => return Err(err),
+         }
+     }
++    Ok(())
+ }
+ 
+ fn forward_attached(
++    stop: &StopSignal,
+     kmsg: &mut File,
+     tty: &mut File,
+     backlog: &mut Backlog,
+     record: &mut [u8],
+ ) -> io::Result<()> {
+-    flush_backlog(tty, backlog)?;
++    flush_backlog(stop, tty, backlog)?;
+ 
+-    loop {
++    while !stop.requested() {
+         match read_kmsg(kmsg, record)? {
+             KmsgRead::Record(read) => {
+                 backlog.push(&record[..read]);
+-                flush_backlog_records(tty, backlog)?;
++                flush_backlog_records(stop, tty, backlog)?;
+             }
+-            KmsgRead::Empty => thread::sleep(Duration::from_millis(50)),
++            KmsgRead::Empty => sleep_stoppable(stop, Duration::from_millis(50)),
+             KmsgRead::Overwritten => {
+                 backlog.push_message(b"pocketboot: kmsg records were overwritten");
+-                flush_backlog_records(tty, backlog)?;
++                flush_backlog_records(stop, tty, backlog)?;
+             }
+         }
+     }
++    Ok(())
+ }
+ 
+ fn open_kmsg() -> io::Result<File> {
+@@ -103,11 +185,21 @@ fn open_kmsg() -> io::Result<File> {
+     Ok(file)
+ }
+ 
+-fn wait_for_tty(kmsg: &mut File, backlog: &mut Backlog, record: &mut [u8]) -> io::Result<File> {
++fn wait_for_tty(
++    stop: &StopSignal,
++    kmsg: &mut File,
++    backlog: &mut Backlog,
++    record: &mut [u8],
++) -> io::Result<File> {
+     let start = Instant::now();
+-    loop {
+-        drain_kmsg_to_backlog(kmsg, backlog, record)?;
+-        match File::options().read(true).write(true).open(TTY_GS0) {
++    while !stop.requested() {
++        drain_kmsg_to_backlog(stop, kmsg, backlog, record)?;
++        match File::options()
++            .read(true)
++            .write(true)
++            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
++            .open(TTY_GS0)
++        {
+             Ok(file) => {
+                 configure_tty(&file)?;
+                 tracing::info!(
+@@ -119,18 +211,20 @@ fn wait_for_tty(kmsg: &mut File, backlog: &mut Backlog, record: &mut [u8]) -> io
+                     dropped_bytes = backlog.dropped_bytes,
+                     "kmsg forwarder attached to tty"
+                 );
+-                wait_for_host_dtr(&file, kmsg, backlog, record)?;
++                wait_for_host_dtr(stop, &file, kmsg, backlog, record)?;
+                 return Ok(file);
+             }
+             Err(err) if should_retry_open(&err) => {
+-                thread::sleep(Duration::from_millis(100));
++                sleep_stoppable(stop, Duration::from_millis(100));
+             }
+             Err(err) => return Err(err),
+         }
+     }
++    Err(stopped_error())
+ }
+ 
+ fn wait_for_host_dtr(
++    stop: &StopSignal,
+     tty: &File,
+     kmsg: &mut File,
+     backlog: &mut Backlog,
+@@ -138,8 +232,8 @@ fn wait_for_host_dtr(
+ ) -> io::Result<()> {
+     let start = Instant::now();
+     let mut logged_wait = false;
+-    loop {
+-        drain_kmsg_to_backlog(kmsg, backlog, record)?;
++    while !stop.requested() {
++        drain_kmsg_to_backlog(stop, kmsg, backlog, record)?;
+         match tty_modem_bits(tty) {
+             Ok(bits) if bits & libc::TIOCM_DTR != 0 => {
+                 tracing::info!(
+@@ -154,25 +248,35 @@ fn wait_for_host_dtr(
+                     tracing::debug!("waiting for host CDC-ACM DTR before kmsg replay");
+                     logged_wait = true;
+                 }
+-                thread::sleep(Duration::from_millis(25));
++                sleep_stoppable(stop, Duration::from_millis(25));
+             }
+             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+             Err(err) if matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOTTY)) => {
+                 tracing::warn!(error = ?err, "CDC-ACM DTR unavailable; falling back to tty settle delay");
+-                return settle_tty(kmsg, backlog, record);
++                return settle_tty(stop, kmsg, backlog, record);
+             }
+             Err(err) => return Err(err),
+         }
+     }
++    Err(stopped_error())
+ }
+ 
+-fn settle_tty(kmsg: &mut File, backlog: &mut Backlog, record: &mut [u8]) -> io::Result<()> {
++fn settle_tty(
++    stop: &StopSignal,
++    kmsg: &mut File,
++    backlog: &mut Backlog,
++    record: &mut [u8],
++) -> io::Result<()> {
+     let start = Instant::now();
+-    while start.elapsed() < Duration::from_millis(TTY_SETTLE_MS) {
+-        drain_kmsg_to_backlog(kmsg, backlog, record)?;
+-        thread::sleep(Duration::from_millis(25));
++    while !stop.requested() && start.elapsed() < Duration::from_millis(TTY_SETTLE_MS) {
++        drain_kmsg_to_backlog(stop, kmsg, backlog, record)?;
++        sleep_stoppable(stop, Duration::from_millis(25));
++    }
++    if stop.requested() {
++        Err(stopped_error())
++    } else {
++        Ok(())
+     }
+-    Ok(())
+ }
+ 
+ fn configure_tty(tty: &File) -> io::Result<()> {
+@@ -276,11 +380,12 @@ fn read_kmsg(kmsg: &mut File, record: &mut [u8]) -> io::Result<KmsgRead> {
+ }
+ 
+ fn drain_kmsg_to_backlog(
++    stop: &StopSignal,
+     kmsg: &mut File,
+     backlog: &mut Backlog,
+     record: &mut [u8],
+ ) -> io::Result<()> {
+-    loop {
++    while !stop.requested() {
+         match read_kmsg(kmsg, record)? {
+             KmsgRead::Record(read) => backlog.push(&record[..read]),
+             KmsgRead::Empty => return Ok(()),
+@@ -289,13 +394,19 @@ fn drain_kmsg_to_backlog(
+             }
+         }
+     }
++    Err(stopped_error())
+ }
+ 
+-fn flush_backlog(tty: &mut File, backlog: &mut Backlog) -> io::Result<()> {
+-    write_tty_line_flushed(tty, b"pocketboot: forwarding kernel log from /dev/kmsg")?;
++fn flush_backlog(stop: &StopSignal, tty: &mut File, backlog: &mut Backlog) -> io::Result<()> {
++    write_tty_line_flushed(
++        stop,
++        tty,
++        b"pocketboot: forwarding kernel log from /dev/kmsg",
++    )?;
+ 
+     if backlog.dropped_records > 0 {
+         write_tty_line_flushed(
++            stop,
+             tty,
+             format!(
+                 "pocketboot: kmsg backlog dropped {} records/{} bytes",
+@@ -312,16 +423,20 @@ fn flush_backlog(tty: &mut File, backlog: &mut Backlog) -> io::Result<()> {
+         "flushing kmsg backlog"
+     );
+ 
+-    flush_backlog_records(tty, backlog)?;
++    flush_backlog_records(stop, tty, backlog)?;
+ 
+     tracing::info!("kmsg forwarder backlog flushed");
+     Ok(())
+ }
+ 
+-fn flush_backlog_records(tty: &mut File, backlog: &mut Backlog) -> io::Result<()> {
++fn flush_backlog_records(
++    stop: &StopSignal,
++    tty: &mut File,
++    backlog: &mut Backlog,
++) -> io::Result<()> {
+     flush_backlog_records_with(backlog, |record| {
+-        write_kmsg_record(tty, record)?;
+-        wait_for_tty_queue(tty)
++        write_kmsg_record(stop, tty, record)?;
++        wait_for_tty_queue(stop, tty)
+     })
+ }
+ 
+@@ -337,29 +452,52 @@ fn flush_backlog_records_with(
+     Ok(())
+ }
+ 
+-fn write_kmsg_record(tty: &mut File, raw: &[u8]) -> io::Result<()> {
+-    kmsg::for_each_record_line(raw, |line| write_tty_line(tty, line.as_bytes()))?;
++fn write_kmsg_record(stop: &StopSignal, tty: &mut File, raw: &[u8]) -> io::Result<()> {
++    kmsg::for_each_record_line(raw, |line| write_tty_line(stop, tty, line.as_bytes()))?;
+     tty.flush()
+ }
+ 
+-fn write_tty_line_flushed(tty: &mut File, line: &[u8]) -> io::Result<()> {
+-    write_tty_line(tty, line)?;
++fn write_tty_line_flushed(stop: &StopSignal, tty: &mut File, line: &[u8]) -> io::Result<()> {
++    write_tty_line(stop, tty, line)?;
+     tty.flush()?;
+-    wait_for_tty_queue(tty)
++    wait_for_tty_queue(stop, tty)
+ }
+ 
+-fn write_tty_line(tty: &mut File, line: &[u8]) -> io::Result<()> {
++fn write_tty_line(stop: &StopSignal, tty: &mut File, line: &[u8]) -> io::Result<()> {
+     let mut buffer = Vec::with_capacity(line.len() + 2);
+     buffer.extend_from_slice(line);
+     buffer.extend_from_slice(b"\r\n");
+-    tty.write_all(&buffer)
++    write_all_stoppable(stop, tty, &buffer)
+ }
+ 
+-fn wait_for_tty_queue(tty: &File) -> io::Result<()> {
+-    loop {
++fn write_all_stoppable(stop: &StopSignal, tty: &mut File, mut bytes: &[u8]) -> io::Result<()> {
++    while !bytes.is_empty() {
++        if stop.requested() {
++            return Err(stopped_error());
++        }
++        match tty.write(bytes) {
++            Ok(0) => {
++                return Err(io::Error::new(
++                    io::ErrorKind::WriteZero,
++                    "failed to write tty output",
++                ));
++            }
++            Ok(written) => bytes = &bytes[written..],
++            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
++            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
++                sleep_stoppable(stop, STOP_POLL_INTERVAL);
++            }
++            Err(err) => return Err(err),
++        }
++    }
++    Ok(())
++}
++
++fn wait_for_tty_queue(stop: &StopSignal, tty: &File) -> io::Result<()> {
++    while !stop.requested() {
+         match tty_pending_bytes(tty) {
+             Ok(pending) if pending <= TTY_QUEUE_HIGH_WATER => return Ok(()),
+-            Ok(_) => thread::sleep(Duration::from_millis(10)),
++            Ok(_) => sleep_stoppable(stop, STOP_POLL_INTERVAL),
+             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+             Err(err) if matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOTTY)) => {
+                 return Ok(());
+@@ -367,6 +505,22 @@ fn wait_for_tty_queue(tty: &File) -> io::Result<()> {
+             Err(err) => return Err(err),
+         }
+     }
++    Err(stopped_error())
++}
++
++fn stopped_error() -> io::Error {
++    io::Error::new(io::ErrorKind::Interrupted, "kmsg forwarder stopped")
++}
++
++fn sleep_stoppable(stop: &StopSignal, duration: Duration) {
++    let deadline = Instant::now() + duration;
++    while !stop.requested() {
++        let now = Instant::now();
++        if now >= deadline {
++            break;
++        }
++        thread::sleep((deadline - now).min(STOP_POLL_INTERVAL));
++    }
+ }
+ 
+ fn tty_pending_bytes(tty: &File) -> io::Result<usize> {
+@@ -392,6 +546,61 @@ fn tty_modem_bits(tty: &File) -> io::Result<libc::c_int> {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use std::sync::atomic::AtomicUsize;
++
++    struct DropProbe(Arc<AtomicUsize>);
++
++    impl Drop for DropProbe {
++        fn drop(&mut self) {
++            self.0.fetch_add(1, Ordering::SeqCst);
++        }
++    }
++
++    #[test]
++    fn shutdown_joins_owner_and_closes_its_resources() {
++        let stop = StopSignal::default();
++        let thread_stop = stop.clone();
++        let drops = Arc::new(AtomicUsize::new(0));
++        let thread_drops = drops.clone();
++        let thread = thread::spawn(move || {
++            let _probe = DropProbe(thread_drops);
++            while !thread_stop.requested() {
++                thread::sleep(STOP_POLL_INTERVAL);
++            }
++        });
++        let handle = Handle {
++            stop,
++            thread: Some(thread),
++        };
++
++        assert_eq!(
++            handle.stop_and_join(Duration::from_secs(1)),
++            Shutdown::Joined
++        );
++        assert_eq!(drops.load(Ordering::SeqCst), 1);
++    }
++
++    #[test]
++    fn timed_out_shutdown_does_not_claim_that_tty_is_closed() {
++        let stop = StopSignal::default();
++        let (release_tx, release_rx) = std::sync::mpsc::channel();
++        let (done_tx, done_rx) = std::sync::mpsc::channel();
++        let thread = thread::spawn(move || {
++            release_rx.recv().unwrap();
++            done_tx.send(()).unwrap();
++        });
++        let handle = Handle {
++            stop,
++            thread: Some(thread),
++        };
++
++        let shutdown = handle.stop_and_join(Duration::from_millis(25));
++        assert_eq!(shutdown, Shutdown::TimedOut);
++        assert!(!shutdown.tty_closed());
++
++        release_tx.send(()).unwrap();
++        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
++    }
+ 
+     #[test]
+     fn successful_flush_removes_records_from_backlog() {
+diff --git a/src/main.rs b/src/main.rs
+index 0105652..78875d4 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -120,9 +120,7 @@ async fn run() -> Result<()> {
+     if let Err(err) = qemu::spawn() {
+         tracing::warn!(error = ?err, "failed to spawn QEMU USB/IP service");
+     }
+-    if acm {
+-        kmsg_forwarder::spawn();
+-    } else {
++    if !acm {
+         tracing::info!(param = ACM_CMDLINE_PARAM, "CDC-ACM disabled");
+     }
+ 
+diff --git a/xtask/src/commands/busybox.rs b/xtask/src/commands/busybox.rs
+index d3ec630..0ed5a4a 100644
+--- a/xtask/src/commands/busybox.rs
++++ b/xtask/src/commands/busybox.rs
+@@ -874,6 +874,19 @@ mod tests {
+         assert!(!configured.contains("# CONFIG_SHA256SUM is not set"));
+     }
+ 
++    #[test]
++    fn recovery_recipe_keeps_getty_available_for_pid1_supervision() {
++        let temp = TempDir::new();
++        let config = temp.path.join(".config");
++        fs::write(&config, "# CONFIG_GETTY is not set\n").unwrap();
++
++        configure_busybox(&config, &FeatureSet::default()).unwrap();
++
++        let configured = fs::read_to_string(config).unwrap();
++        assert_eq!(configured.matches("CONFIG_GETTY=y").count(), 1);
++        assert!(!configured.contains("# CONFIG_GETTY is not set"));
++    }
++
+     struct TempDir {
+         path: PathBuf,
+     }

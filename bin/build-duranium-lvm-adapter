@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""Build a deterministic outer-LVM initrd overlay for Duranium."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import struct
+import tempfile
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+
+LVM_UUID_RE = re.compile(
+    r"[A-Za-z0-9]{6}(?:-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}\Z"
+)
+LV_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9+_.-]*\Z")
+LVM_TAG_RE = re.compile(r"[A-Za-z0-9_+./=!:#&-]+\Z")
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+PT_INTERP = 3
+EM_AARCH64 = 183
+
+
+@dataclass(frozen=True)
+class Entry:
+    name: str
+    mode: int
+    data: bytes = b""
+
+
+def fail(message: str) -> "None":
+    raise SystemExit(f"build-duranium-lvm-adapter: {message}")
+
+
+def canonical_partuuid(value: str) -> str:
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        fail(f"invalid userdata PARTUUID: {value}")
+    canonical = str(parsed)
+    if value != canonical:
+        fail(f"userdata PARTUUID must use canonical lowercase form: {canonical}")
+    return canonical
+
+
+def checked_lvm_uuid(kind: str, value: str) -> str:
+    if not LVM_UUID_RE.fullmatch(value):
+        fail(f"invalid {kind}: {value}")
+    return value
+
+
+def checked_sha256(kind: str, value: str) -> str:
+    if not SHA256_RE.fullmatch(value):
+        fail(f"invalid {kind} SHA-256: {value}")
+    return value
+
+
+def read_pinned(kind: str, path_arg: str, expected: str) -> tuple[Path, bytes]:
+    path = Path(path_arg).expanduser().resolve(strict=True)
+    if not path.is_file():
+        fail(f"{kind} is not a regular file: {path}")
+    data = path.read_bytes()
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        fail(f"{kind} SHA-256 mismatch: expected {expected}, got {actual}")
+    return path, data
+
+
+def elf_interpreter(kind: str, data: bytes) -> str | None:
+    if len(data) < 64 or data[:4] != b"\x7fELF":
+        fail(f"{kind} is not an ELF file")
+    if data[4] != 2 or data[5] != 1:
+        fail(f"{kind} must be a little-endian ELF64 file")
+    machine = struct.unpack_from("<H", data, 18)[0]
+    if machine != EM_AARCH64:
+        fail(f"{kind} must target AArch64 (ELF e_machine={machine})")
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    phentsize = struct.unpack_from("<H", data, 54)[0]
+    phnum = struct.unpack_from("<H", data, 56)[0]
+    if phnum and phentsize < 56:
+        fail(f"{kind} has an invalid program-header size")
+    if phoff + phentsize * phnum > len(data):
+        fail(f"{kind} has program headers outside the file")
+    interpreter = None
+    for index in range(phnum):
+        offset = phoff + index * phentsize
+        p_type = struct.unpack_from("<I", data, offset)[0]
+        if p_type != PT_INTERP:
+            continue
+        p_offset = struct.unpack_from("<Q", data, offset + 8)[0]
+        p_filesz = struct.unpack_from("<Q", data, offset + 32)[0]
+        if p_filesz < 2 or p_offset + p_filesz > len(data):
+            fail(f"{kind} has an invalid PT_INTERP")
+        raw = data[p_offset : p_offset + p_filesz]
+        if not raw.endswith(b"\0"):
+            fail(f"{kind} PT_INTERP is not NUL-terminated")
+        try:
+            candidate = raw[:-1].decode("ascii")
+        except UnicodeDecodeError:
+            fail(f"{kind} PT_INTERP is not ASCII")
+        if interpreter is not None:
+            fail(f"{kind} has multiple PT_INTERP headers")
+        interpreter = candidate
+    return interpreter
+
+
+def align(data: bytearray, boundary: int) -> None:
+    data.extend(b"\0" * (-len(data) % boundary))
+
+
+def append_newc(output: bytearray, entry: Entry, inode: int, mtime: int) -> None:
+    name = entry.name.encode("utf-8") + b"\0"
+    fields = (
+        inode,
+        entry.mode,
+        0,
+        0,
+        1,
+        mtime,
+        len(entry.data),
+        0,
+        0,
+        0,
+        0,
+        len(name),
+        0,
+    )
+    output.extend(b"070701" + b"".join(f"{field:08x}".encode() for field in fields))
+    output.extend(name)
+    align(output, 4)
+    output.extend(entry.data)
+    align(output, 4)
+
+
+def make_newc(entries: list[Entry], mtime: int) -> bytes:
+    names = [entry.name for entry in entries]
+    if len(names) != len(set(names)):
+        fail("internal error: duplicate cpio path")
+    output = bytearray()
+    for inode, entry in enumerate(sorted(entries, key=lambda item: item.name), 1):
+        append_newc(output, entry, inode, mtime)
+    append_newc(output, Entry("TRAILER!!!", 0), len(entries) + 1, mtime)
+    align(output, 512)
+    return bytes(output)
+
+
+def directory(name: str) -> Entry:
+    return Entry(name, stat.S_IFDIR | 0o755)
+
+
+def regular(name: str, data: bytes | str, mode: int = 0o644) -> Entry:
+    if isinstance(data, str):
+        data = data.encode()
+    return Entry(name, stat.S_IFREG | mode, data)
+
+
+def symlink(name: str, target: str) -> Entry:
+    return Entry(name, stat.S_IFLNK | 0o777, target.encode())
+
+
+def render_config(args: argparse.Namespace, hashes: dict[str, str], dynamic: bool) -> str:
+    values = {
+        "DURANIUM_USERDATA_PARTUUID": args.userdata_partuuid,
+        "DURANIUM_PV_UUID": args.pv_uuid,
+        "DURANIUM_VG_UUID": args.vg_uuid,
+        "DURANIUM_DISK_LV_UUID": args.disk_lv_uuid,
+        "DURANIUM_DISK_LV_NAME": args.disk_lv_name,
+        "DURANIUM_DISK_LV_TAG": args.disk_lv_tag,
+        "DURANIUM_LVM_SHA256": hashes["lvm_static"],
+        "DURANIUM_THIN_CHECK_SHA256": hashes["thin_check"],
+        "DURANIUM_THIN_CHECK_DYNAMIC": "yes" if dynamic else "no",
+    }
+    if dynamic:
+        values.update(
+            {
+                "DURANIUM_THIN_LOADER_SHA256": hashes["thin_loader"],
+                "DURANIUM_THIN_LIBGCC_SHA256": hashes["thin_libgcc"],
+                "DURANIUM_THIN_LIBUDEV_SHA256": hashes["thin_libudev"],
+            }
+        )
+    return "".join(f"{key}={value}\n" for key, value in values.items())
+
+
+def render_lvm_config(args: argparse.Namespace) -> str:
+    return f'''# Generated by build-duranium-lvm-adapter. @ANCHOR@ is replaced in /run.
+devices {{
+    use_devicesfile = 0
+    obtain_device_list_from_udev = 0
+    external_device_info_source = "none"
+    scan = [ "/dev" ]
+    preferred_names = [ "^/dev/disk/by-partuuid/{args.userdata_partuuid}$" ]
+    filter = [
+        "a|^@ANCHOR@$|",
+        "a|^/dev/disk/by-partuuid/{args.userdata_partuuid}$|",
+        "r|.*|"
+    ]
+    global_filter = [
+        "a|^@ANCHOR@$|",
+        "a|^/dev/disk/by-partuuid/{args.userdata_partuuid}$|",
+        "r|.*|"
+    ]
+}}
+allocation {{
+    thin_pool_metadata_require_separate_pvs = 0
+}}
+activation {{
+    udev_sync = 0
+    udev_rules = 0
+    monitoring = 0
+    auto_activation_volume_list = [ ]
+    read_only_volume_list = [ "@{args.disk_lv_tag}" ]
+}}
+backup {{
+    backup = 0
+    archive = 0
+}}
+global {{
+    thin_check_executable = "/usr/sbin/thin_check"
+    thin_check_options = [ "-q" ]
+    event_activation = 0
+    use_lvmpolld = 0
+    use_lvmlockd = 0
+    notify_dbus = 0
+}}
+log {{
+    syslog = 0
+}}
+'''
+
+
+ATTACH_SCRIPT = r'''#!/bin/sh
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+CONFIG=/etc/frankensargo/duranium-lvm.conf
+LVM=/usr/lib/frankensargo-duranium/lvm.static
+RUNTIME=/usr/lib/frankensargo-duranium
+
+log()
+{
+    message="frankensargo-duranium: $*"
+    printf '%s\n' "$message" >&2
+    if [ -w /dev/kmsg ]; then
+        printf '<3>%s\n' "$message" >/dev/kmsg 2>/dev/null || :
+    fi
+}
+
+die()
+{
+    log "$*"
+    exit 1
+}
+
+ensure_api_filesystems()
+{
+    mkdir -p /proc /sys /dev /run
+    if [ ! -r /proc/mounts ] || ! mounted_as /proc proc; then
+        mount -t proc proc /proc
+    fi
+    mounted_as /proc proc || die '/proc is not a proc filesystem'
+    if ! mounted_as /sys sysfs; then
+        mount -t sysfs sysfs /sys
+    fi
+    mounted_as /sys sysfs || die '/sys is not a sysfs filesystem'
+    if ! mounted_as /dev devtmpfs; then
+        mount -t devtmpfs devtmpfs /dev
+    fi
+    mounted_as /dev devtmpfs || die '/dev is not a devtmpfs filesystem'
+    mkdir -p /dev/disk/by-partuuid /dev/disk/by-loop-ref /dev/mapper /dev/pts /dev/shm
+    if ! mounted_as /run tmpfs; then
+        mount -t tmpfs -o mode=0755,nodev,nosuid tmpfs /run
+    fi
+    mounted_as /run tmpfs || die '/run is not a tmpfs filesystem'
+}
+
+mounted_as()
+{
+    mountpoint=$1
+    filesystem=$2
+    [ -r /proc/mounts ] || return 1
+    awk -v mountpoint="$mountpoint" -v filesystem="$filesystem" '
+        $2 == mountpoint && $3 == filesystem { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' /proc/mounts
+}
+
+check_hash()
+{
+    expected=$1
+    file=$2
+    printf '%s  %s\n' "$expected" "$file" | sha256sum -c - >/dev/null 2>&1 ||
+        die "pinned input hash mismatch: $file"
+}
+
+require_cmdline()
+{
+    cmdline=" $(cat /proc/cmdline) "
+    case $cmdline in
+        *' root=dissect '*) ;;
+        *) die 'kernel command line lacks root=dissect' ;;
+    esac
+    case $cmdline in
+        *' mount.usr=dissect '*) ;;
+        *) die 'kernel command line lacks mount.usr=dissect' ;;
+    esac
+    case $cmdline in
+        *' sysrq_always_enabled=1 '*) ;;
+        *) die 'kernel command line lacks sysrq_always_enabled=1' ;;
+    esac
+    printf '%s\n' "$cmdline" |
+        grep -Eq '(^|[[:space:]])usrhash=[0-9a-f]{64}([[:space:]]|$)' ||
+        die 'kernel command line lacks a canonical Duranium usrhash='
+}
+
+find_anchor()
+{
+    found=
+    count=0
+    attempts=0
+    while [ "$attempts" -lt 60 ]; do
+        found=
+        count=0
+        for uevent in /sys/class/block/*/uevent; do
+            [ -f "$uevent" ] || continue
+            partuuid=$(sed -n 's/^PARTUUID=//p' "$uevent")
+            [ "$partuuid" = "$DURANIUM_USERDATA_PARTUUID" ] || continue
+            devtype=$(sed -n 's/^DEVTYPE=//p' "$uevent")
+            [ "$devtype" = partition ] || die 'matching PARTUUID is not a partition'
+            devname=$(sed -n 's/^DEVNAME=//p' "$uevent")
+            case $devname in
+                ''|*[!A-Za-z0-9._/-]*) die 'unsafe DEVNAME for matching PARTUUID' ;;
+            esac
+            candidate=/dev/$devname
+            [ -b "$candidate" ] || continue
+            found=$candidate
+            count=$((count + 1))
+        done
+        [ "$count" -eq 0 ] || break
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+    [ "$count" -eq 1 ] || die "PARTUUID match count is $count, expected 1"
+    ANCHOR=$(readlink -f "$found")
+    case $ANCHOR in
+        /dev/*) ;;
+        *) die 'anchor did not resolve below /dev' ;;
+    esac
+    anchor_name=${ANCHOR##*/}
+    [ "$(cat "/sys/class/block/$anchor_name/removable")" = 0 ] ||
+        die 'anchor is removable'
+
+    mkdir -p /dev/disk/by-partuuid
+    anchor_link=/dev/disk/by-partuuid/$DURANIUM_USERDATA_PARTUUID
+    if [ -e "$anchor_link" ] || [ -L "$anchor_link" ]; then
+        [ "$(readlink -f "$anchor_link")" = "$ANCHOR" ] ||
+            die 'PARTUUID symlink collides with another device'
+    else
+        ln -s "$ANCHOR" "$anchor_link"
+    fi
+}
+
+prepare_lvm_config()
+{
+    export LVM_SYSTEM_DIR=/run/frankensargo/lvm
+    mkdir -p "$LVM_SYSTEM_DIR" /run/lock/lvm /run/lvm
+    sed "s|@ANCHOR@|$ANCHOR|g" \
+        /etc/frankensargo/lvm/lvm.conf.template >"$LVM_SYSTEM_DIR/lvm.conf"
+}
+
+lvm_report()
+{
+    command=$1
+    shift
+    "$LVM" "$command" --devices "$ANCHOR" --nohints --quiet "$@"
+}
+
+verify_pv_and_lv()
+{
+    pv_record=$(lvm_report pvs --readonly --noheadings --unquoted \
+        --separator '|' -o pv_uuid,vg_uuid,vg_name "$ANCHOR" |
+        awk -F'|' '
+            { for (i=1; i<=NF; i++) gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i) }
+            NF == 3 { if (++n > 1) exit 2; print $1 "|" $2 "|" $3 }
+            END { if (n != 1) exit 3 }
+        ') || die 'unable to read exactly one anchor PV record'
+    actual_pv_uuid=$(printf '%s\n' "$pv_record" | cut -d '|' -f 1)
+    actual_vg_uuid=$(printf '%s\n' "$pv_record" | cut -d '|' -f 2)
+    VG_NAME=$(printf '%s\n' "$pv_record" | cut -d '|' -f 3)
+    [ "$actual_pv_uuid" = "$DURANIUM_PV_UUID" ] ||
+        die "PV UUID mismatch: $actual_pv_uuid"
+    [ "$actual_vg_uuid" = "$DURANIUM_VG_UUID" ] ||
+        die "VG UUID mismatch: $actual_vg_uuid"
+    case $VG_NAME in
+        ''|*[!A-Za-z0-9+_.-]*) die 'unsafe VG name from LVM metadata' ;;
+    esac
+
+    lv_record=$(lvm_report lvs --readonly --noheadings --unquoted \
+        --separator '|' -o vg_uuid,lv_uuid,vg_name,lv_name,lv_tags,lv_attr,pool_lv \
+        "$VG_NAME" |
+        awk -F'|' -v want="$DURANIUM_DISK_LV_UUID" '
+            { for (i=1; i<=NF; i++) gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i) }
+            NF == 7 && $2 == want {
+                if (++n > 1) exit 2
+                print $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7
+            }
+            END { if (n != 1) exit 3 }
+        ') || die 'unable to find exactly one expected LV UUID'
+    lv_vg_uuid=$(printf '%s\n' "$lv_record" | cut -d '|' -f 1)
+    lv_uuid=$(printf '%s\n' "$lv_record" | cut -d '|' -f 2)
+    lv_vg_name=$(printf '%s\n' "$lv_record" | cut -d '|' -f 3)
+    lv_name=$(printf '%s\n' "$lv_record" | cut -d '|' -f 4)
+    LV_TAGS=$(printf '%s\n' "$lv_record" | cut -d '|' -f 5)
+    LV_ATTR=$(printf '%s\n' "$lv_record" | cut -d '|' -f 6)
+    POOL_NAME=$(printf '%s\n' "$lv_record" | cut -d '|' -f 7)
+    [ "$lv_vg_uuid" = "$DURANIUM_VG_UUID" ] ||
+        die 'LV belongs to the wrong VG UUID'
+    [ "$lv_uuid" = "$DURANIUM_DISK_LV_UUID" ] ||
+        die 'LV UUID changed during report'
+    [ "$lv_vg_name" = "$VG_NAME" ] || die 'LV VG name mismatch'
+    [ "$lv_name" = "$DURANIUM_DISK_LV_NAME" ] || die "LV name mismatch: $lv_name"
+    case ,$LV_TAGS, in
+        *,"$DURANIUM_DISK_LV_TAG",*) ;;
+        *) die "LV lacks exact tag: $DURANIUM_DISK_LV_TAG" ;;
+    esac
+    case $LV_ATTR in
+        V*) ;;
+        *) die "expected a thin LV, got attributes: $LV_ATTR" ;;
+    esac
+    case $POOL_NAME in
+        ''|*[!A-Za-z0-9+_.-]*) die 'expected LV has no safe thin-pool name' ;;
+    esac
+    LV_PATH=/dev/$VG_NAME/$DURANIUM_DISK_LV_NAME
+}
+
+verify_active_lv()
+{
+    [ -b "$LV_PATH" ] || return 1
+    lv_real=$(readlink -f "$LV_PATH")
+    lv_base=${lv_real##*/}
+    case $lv_base in
+        dm-[0-9]*) ;;
+        *) die 'active LV did not resolve to a device-mapper node' ;;
+    esac
+    compact_vg=$(printf '%s' "$DURANIUM_VG_UUID" | tr -d '-')
+    compact_lv=$(printf '%s' "$DURANIUM_DISK_LV_UUID" | tr -d '-')
+    expected_dm_uuid=LVM-$compact_vg$compact_lv
+    actual_dm_uuid=$(cat "/sys/class/block/$lv_base/dm/uuid")
+    [ "$actual_dm_uuid" = "$expected_dm_uuid" ] ||
+        die 'active device-mapper UUID does not match the expected VG/LV UUIDs'
+    blockdev --setro "$LV_PATH"
+    [ "$(blockdev --getro "$LV_PATH")" = 1 ] || die 'disk LV is not read-only'
+    LV_REAL=$lv_real
+}
+
+activate_exact_lv()
+{
+    if ! verify_active_lv; then
+        lvm_report lvchange --activate y "$VG_NAME/$DURANIUM_DISK_LV_NAME" ||
+            die 'exact LV activation failed'
+        verify_active_lv || die 'exact LV did not appear after activation'
+    fi
+}
+
+verify_loop()
+{
+    loop=$1
+    [ -b "$loop" ] || die 'rootdisk loop reference is not a block device'
+    loop=$(readlink -f "$loop")
+    loop_base=${loop##*/}
+    case $loop_base in
+        loop[0-9]*) ;;
+        *) die 'rootdisk reference did not resolve to a loop device' ;;
+    esac
+    [ "$(cat "/sys/class/block/$loop_base/ro")" = 1 ] ||
+        die 'rootdisk loop is not read-only'
+    backing=$(cat "/sys/class/block/$loop_base/loop/backing_file")
+    [ "$(readlink -f "$backing")" = "$LV_REAL" ] ||
+        die 'rootdisk loop has the wrong backing device'
+    [ "$(blkid -p -s PTTYPE -o value "$loop")" = gpt ] ||
+        die 'rootdisk loop does not contain a GPT'
+    attempts=0
+    while [ "$attempts" -lt 30 ]; do
+        set -- /sys/class/block/"$loop_base"/"${loop_base}"p*
+        [ -e "$1" ] && break
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+    [ -e "$1" ] || die 'rootdisk GPT partitions did not appear'
+    LOOP=$loop
+}
+
+attach_or_verify_loop()
+{
+    ref=/dev/disk/by-loop-ref/rootdisk
+    if [ -e "$ref" ] || [ -L "$ref" ]; then
+        verify_loop "$ref"
+        return
+    fi
+    [ "$MODE" = attach ] || die 'rootdisk loop is absent during verification'
+    loop=$(losetup --find --show --nooverlap --read-only --partscan \
+        --loop-ref rootdisk "$LV_PATH") || die 'unable to attach rootdisk loop'
+    verify_loop "$loop"
+    mkdir -p /dev/disk/by-loop-ref
+    if [ -e "$ref" ] || [ -L "$ref" ]; then
+        [ "$(readlink -f "$ref")" = "$LOOP" ] || die 'rootdisk udev reference collision'
+    else
+        ln -s "$LOOP" "$ref"
+    fi
+}
+
+case ${1-} in
+    --attach) MODE=attach ;;
+    --verify-active) MODE=verify ;;
+    *) die 'usage: frankensargo-duranium-lvm-attach --attach|--verify-active' ;;
+esac
+
+ensure_api_filesystems
+[ -r "$CONFIG" ] || die 'missing immutable adapter configuration'
+# This file is generated from strictly validated token alphabets.
+# shellcheck disable=SC1090
+. "$CONFIG"
+require_cmdline
+check_hash "$DURANIUM_LVM_SHA256" "$LVM"
+check_hash "$DURANIUM_THIN_CHECK_SHA256" "$RUNTIME/thin_check"
+if [ "$DURANIUM_THIN_CHECK_DYNAMIC" = yes ]; then
+    check_hash "$DURANIUM_THIN_LOADER_SHA256" "$RUNTIME/ld-musl-aarch64.so.1"
+    check_hash "$DURANIUM_THIN_LIBGCC_SHA256" "$RUNTIME/libgcc_s.so.1"
+    check_hash "$DURANIUM_THIN_LIBUDEV_SHA256" "$RUNTIME/libudev.so.1"
+fi
+modprobe loop || die 'loop module unavailable'
+modprobe dm-thin-pool || die 'dm-thin-pool module unavailable'
+find_anchor
+prepare_lvm_config
+verify_pv_and_lv
+if [ "$MODE" = attach ]; then
+    activate_exact_lv
+else
+    verify_active_lv || die 'exact disk LV is not active'
+fi
+attach_or_verify_loop
+mkdir -p /run/frankensargo
+printf '%s\n' "$LOOP" >/run/frankensargo/duranium-rootdisk
+log "verified $DURANIUM_DISK_LV_UUID as rootdisk on $LOOP"
+'''
+
+
+INIT_SHIM = r'''#!/bin/sh
+# This overlay is appended after Duranium's initrd and deliberately replaces
+# its /init symlink so rootdisk exists before systemd runs generators.
+if /usr/libexec/frankensargo-duranium-lvm-attach --attach; then
+    exec /usr/lib/systemd/systemd "$@"
+fi
+printf '%s\n' 'frankensargo-duranium: attach failed; entering initrd emergency target' >&2
+exec /usr/lib/systemd/systemd --unit=emergency.target "$@"
+'''
+
+
+GENERATOR = r'''#!/bin/sh
+set -eu
+[ "$#" -eq 3 ] || exit 0
+normal=$1
+unit=frankensargo-duranium-lvm.service
+for target in initrd-root-device.target initrd-usr-fs.target; do
+    mkdir -p "$normal/$target.requires"
+    ln -sf "/usr/lib/systemd/system/$unit" "$normal/$target.requires/$unit"
+done
+'''
+
+
+SERVICE = r'''[Unit]
+Description=Verify exact Duranium outer-LVM rootdisk
+DefaultDependencies=no
+AssertPathExists=/etc/initrd-release
+Wants=systemd-udev-settle.service
+After=systemd-udev-settle.service
+Before=initrd-root-device.target initrd-usr-fs.target initrd-root-fs.target systemd-repart.service
+Conflicts=shutdown.target initrd-switch-root.target
+OnFailure=emergency.target
+OnFailureJobMode=replace-irreversibly
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=30
+ExecStart=/usr/libexec/frankensargo-duranium-lvm-attach --verify-active
+StandardOutput=kmsg+console
+StandardError=kmsg+console
+'''
+
+
+THIN_WRAPPER = r'''#!/bin/sh
+RUNTIME=/usr/lib/frankensargo-duranium
+exec "$RUNTIME/ld-musl-aarch64.so.1" \
+    --library-path "$RUNTIME" "$RUNTIME/thin_check" "$@"
+'''
+
+
+def build_entries(
+    args: argparse.Namespace,
+    files: dict[str, bytes],
+    hashes: dict[str, str],
+    dynamic: bool,
+) -> list[Entry]:
+    manifest = {
+        "disk_lv": {
+            "name": args.disk_lv_name,
+            "required_tag": args.disk_lv_tag,
+            "uuid": args.disk_lv_uuid,
+        },
+        "format": "frankensargo.duranium-lvm-adapter.v1",
+        "required_cmdline": [
+            "root=dissect",
+            "mount.usr=dissect",
+            "sysrq_always_enabled=1",
+            "usrhash=<sha256>",
+        ],
+        "source_date_epoch": args.source_date_epoch,
+        "tools": hashes,
+        "userdata_partuuid": args.userdata_partuuid,
+        "vg_uuid": args.vg_uuid,
+        "pv_uuid": args.pv_uuid,
+    }
+    entries = [
+        directory("etc"),
+        directory("etc/frankensargo"),
+        regular("etc/frankensargo/duranium-lvm.conf", render_config(args, hashes, dynamic)),
+        directory("etc/frankensargo/lvm"),
+        regular("etc/frankensargo/lvm/lvm.conf.template", render_lvm_config(args)),
+        regular("init", INIT_SHIM, 0o755),
+        directory("usr"),
+        directory("usr/lib"),
+        directory("usr/lib/frankensargo-duranium"),
+        regular("usr/lib/frankensargo-duranium/lvm.static", files["lvm_static"], 0o755),
+        regular("usr/lib/frankensargo-duranium/thin_check", files["thin_check"], 0o755),
+        regular(
+            "usr/lib/frankensargo-duranium/build-manifest.json",
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        ),
+        directory("usr/lib/systemd"),
+        directory("usr/lib/systemd/system"),
+        regular("usr/lib/systemd/system/frankensargo-duranium-lvm.service", SERVICE),
+        directory("usr/lib/systemd/system-generators"),
+        regular(
+            "usr/lib/systemd/system-generators/00-frankensargo-duranium-lvm-generator",
+            GENERATOR,
+            0o755,
+        ),
+        directory("usr/libexec"),
+        regular("usr/libexec/frankensargo-duranium-lvm-attach", ATTACH_SCRIPT, 0o755),
+        directory("usr/sbin"),
+    ]
+    if dynamic:
+        entries.extend(
+            [
+                regular(
+                    "usr/lib/frankensargo-duranium/ld-musl-aarch64.so.1",
+                    files["thin_loader"],
+                    0o755,
+                ),
+                symlink(
+                    "usr/lib/frankensargo-duranium/libc.musl-aarch64.so.1",
+                    "ld-musl-aarch64.so.1",
+                ),
+                regular(
+                    "usr/lib/frankensargo-duranium/libgcc_s.so.1",
+                    files["thin_libgcc"],
+                    0o755,
+                ),
+                regular(
+                    "usr/lib/frankensargo-duranium/libudev.so.1",
+                    files["thin_libudev"],
+                    0o755,
+                ),
+                regular("usr/sbin/thin_check", THIN_WRAPPER, 0o755),
+            ]
+        )
+    else:
+        entries.append(regular("usr/sbin/thin_check", files["thin_check"], 0o755))
+    return entries
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description="Build a deterministic newc overlay for Duranium-on-exact-LVM",
+    )
+    result.add_argument("--userdata-partuuid", required=True)
+    result.add_argument("--pv-uuid", required=True)
+    result.add_argument("--vg-uuid", required=True)
+    result.add_argument("--disk-lv-uuid", required=True)
+    result.add_argument("--disk-lv-name", required=True)
+    result.add_argument("--disk-lv-tag", required=True)
+    result.add_argument("--lvm-static", required=True)
+    result.add_argument("--lvm-static-sha256", required=True)
+    result.add_argument("--thin-check", required=True)
+    result.add_argument("--thin-check-sha256", required=True)
+    result.add_argument("--thin-loader")
+    result.add_argument("--thin-loader-sha256")
+    result.add_argument("--thin-libgcc")
+    result.add_argument("--thin-libgcc-sha256")
+    result.add_argument("--thin-libudev")
+    result.add_argument("--thin-libudev-sha256")
+    result.add_argument("--output", required=True)
+    result.add_argument("--force", action="store_true")
+    result.add_argument(
+        "--source-date-epoch",
+        type=int,
+        default=int(os.environ.get("SOURCE_DATE_EPOCH", "0")),
+    )
+    return result
+
+
+def main() -> None:
+    args = parser().parse_args()
+    args.userdata_partuuid = canonical_partuuid(args.userdata_partuuid)
+    args.pv_uuid = checked_lvm_uuid("PV UUID", args.pv_uuid)
+    args.vg_uuid = checked_lvm_uuid("VG UUID", args.vg_uuid)
+    args.disk_lv_uuid = checked_lvm_uuid("disk LV UUID", args.disk_lv_uuid)
+    if not LV_NAME_RE.fullmatch(args.disk_lv_name):
+        fail(f"invalid disk LV name: {args.disk_lv_name}")
+    if not LVM_TAG_RE.fullmatch(args.disk_lv_tag):
+        fail(f"invalid disk LV tag: {args.disk_lv_tag}")
+    if not 0 <= args.source_date_epoch <= 0xFFFFFFFF:
+        fail("source date epoch must fit the newc 32-bit mtime field")
+
+    expected = {
+        "lvm_static": checked_sha256("lvm.static", args.lvm_static_sha256),
+        "thin_check": checked_sha256("thin_check", args.thin_check_sha256),
+    }
+    _, lvm_data = read_pinned("lvm.static", args.lvm_static, expected["lvm_static"])
+    if elf_interpreter("lvm.static", lvm_data) is not None:
+        fail("lvm.static has PT_INTERP and is not static")
+    _, thin_data = read_pinned("thin_check", args.thin_check, expected["thin_check"])
+    thin_interpreter = elf_interpreter("thin_check", thin_data)
+    dynamic = thin_interpreter is not None
+    closure_args = (
+        ("thin_loader", "thin-loader", "thin_loader_sha256"),
+        ("thin_libgcc", "thin-libgcc", "thin_libgcc_sha256"),
+        ("thin_libudev", "thin-libudev", "thin_libudev_sha256"),
+    )
+    files = {"lvm_static": lvm_data, "thin_check": thin_data}
+    if dynamic:
+        if thin_interpreter != "/lib/ld-musl-aarch64.so.1":
+            fail(f"unsupported thin_check interpreter: {thin_interpreter}")
+        for key, path_attr, hash_attr in closure_args:
+            path_arg = getattr(args, path_attr.replace("-", "_"))
+            hash_arg = getattr(args, hash_attr)
+            if not path_arg or not hash_arg:
+                fail(f"dynamic thin_check requires --{path_attr} and --{path_attr}-sha256")
+            expected[key] = checked_sha256(key, hash_arg)
+            _, data = read_pinned(key, path_arg, expected[key])
+            elf_interpreter(key, data)
+            files[key] = data
+    else:
+        for _, path_attr, hash_attr in closure_args:
+            if getattr(args, path_attr.replace("-", "_")) or getattr(args, hash_attr):
+                fail("thin_check is static; runtime closure arguments are not allowed")
+
+    output = Path(args.output).expanduser().resolve()
+    if output.exists() and not args.force:
+        fail(f"output exists (use --force to replace it): {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    archive = make_newc(build_entries(args, files, expected, dynamic), args.source_date_epoch)
+    fd, temporary = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(archive)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, output)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    digest = hashlib.sha256(archive).hexdigest()
+    print(f"built {output}")
+    print(f"sha256 {digest}")
+
+
+if __name__ == "__main__":
+    main()

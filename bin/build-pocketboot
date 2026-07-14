@@ -8,19 +8,24 @@ ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/lib/patchset.sh"
 
 kernel_tree=$SDM670_KERNEL_LOCAL
-source_dir=$ROOT/.work/pocketboot
-output_dir=$ROOT/out/pocketboot
+source_dir=
+output_dir=
 prepare_only=0
+no_acm=0
 
 usage() {
     cat <<'EOF'
-usage: bin/build-pocketboot [--kernel-tree PATH] [--source-dir PATH] [--output-dir PATH] [--prepare-only]
+usage: bin/build-pocketboot [--kernel-tree PATH] [--source-dir PATH] [--output-dir PATH] [--prepare-only] [--no-acm]
 
 Build the pinned sargo PocketBoot lab image. This builds files only; it never
 enumerates, boots, flashes, or otherwise communicates with a phone.
 
 --prepare-only repairs/prepares the pinned source tree and exits before the
 large kernel build.
+
+--no-acm publishes a separate lab-no-acm artifact. It leaves the exact patched
+source tree unchanged and removes only the pocketboot.acm token from the two
+Android v2 cmdline fields of the unpublished temporary image.
 EOF
 }
 
@@ -45,6 +50,10 @@ while [ "$#" -gt 0 ]; do
             prepare_only=1
             shift
             ;;
+        --no-acm)
+            no_acm=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -57,7 +66,18 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-for command in git cargo make mktemp sha256sum; do
+if [ -z "$source_dir" ]; then
+    source_dir=$ROOT/.work/pocketboot
+fi
+if [ -z "$output_dir" ]; then
+    if [ "$no_acm" -eq 1 ]; then
+        output_dir=$ROOT/out/pocketboot-noacm
+    else
+        output_dir=$ROOT/out/pocketboot
+    fi
+fi
+
+for command in git cargo flock make mktemp python3 sha256sum; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "build-pocketboot: missing command: $command" >&2
         exit 1
@@ -78,6 +98,12 @@ kernel_head=$(git -C "$kernel_tree" rev-parse HEAD)
 }
 
 mkdir -p "$(dirname -- "$source_dir")" "$output_dir"
+lock_file=$source_dir.frankensargo-build.lock
+exec 9>"$lock_file"
+flock -n 9 || {
+    echo "build-pocketboot: another build holds the source lock: $lock_file" >&2
+    exit 1
+}
 if ! git -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then
     git clone --filter=blob:none --no-checkout "$POCKETBOOT_URL" "$source_dir"
 fi
@@ -133,16 +159,52 @@ patchset_verify_or_apply "$source_dir" "$POCKETBOOT_REV" \
     exit 1
 }
 source_tree=$(patchset_worktree_tree "$source_dir" "$POCKETBOOT_REV")
+effective_tree=$source_tree
+profile=lab
+artifact_name=pocketboot-sargo-lab.img
+profile_tool=$ROOT/lib/pocketboot_profile.py
+base_cmdline=
+effective_cmdline=
+if [ "$no_acm" -eq 1 ]; then
+    profile=lab-no-acm
+    artifact_name=pocketboot-sargo-lab-noacm.img
+    device_config=$source_dir/configs/device/qcom/sdm670-google-sargo.toml
+    base_cmdline=$(python3 "$profile_tool" config-cmdline --config "$device_config")
+    effective_cmdline=$(python3 "$profile_tool" config-cmdline \
+        --config "$device_config" --effective)
+    [ "$base_cmdline" != "$effective_cmdline" ] || {
+        echo "build-pocketboot: no-ACM profile did not change the cmdline" >&2
+        exit 1
+    }
+    restored_tree=$(patchset_worktree_tree "$source_dir" "$POCKETBOOT_REV")
+    [ "$restored_tree" = "$source_tree" ] || {
+        echo "build-pocketboot: profile inspection changed the source tree" >&2
+        exit 1
+    }
+fi
 
 if [ "$prepare_only" -eq 1 ]; then
-    printf 'prepared %s at %s\npatched tree %s\n' \
-        "$source_dir" "$source_head" "$source_tree"
+    printf 'prepared %s at %s\nprofile %s\nbase patched tree %s\neffective tree %s\n' \
+        "$source_dir" "$source_head" "$profile" "$source_tree" "$effective_tree"
+    if [ "$no_acm" -eq 1 ]; then
+        printf 'base cmdline %s\neffective cmdline %s\n' \
+            "$base_cmdline" "$effective_cmdline"
+    fi
     exit 0
 fi
 
-artifact=$output_dir/pocketboot-sargo-lab.img
-tmp_artifact=$output_dir/.pocketboot-sargo-lab.img.tmp
-rm -f "$tmp_artifact"
+artifact=$output_dir/$artifact_name
+tmp_artifact=$output_dir/.$artifact_name.tmp
+tmp_checksum=$output_dir/.$artifact_name.sha256.tmp
+tmp_provenance=$output_dir/.$artifact_name.provenance.tmp
+profile_metadata=$artifact.profile.json
+tmp_profile_metadata=$output_dir/.$artifact_name.profile.json.tmp
+bundle_manifest=$artifact.bundle.json
+bundle_tool=$ROOT/lib/pocketboot_bundle.py
+python3 "$bundle_tool" check-destination \
+    --output-dir "$output_dir" --image-name "$artifact_name" --profile "$profile" \
+    >/dev/null
+rm -f "$tmp_artifact" "$tmp_checksum" "$tmp_provenance" "$tmp_profile_metadata"
 
 (
     cd "$source_dir"
@@ -153,16 +215,90 @@ rm -f "$tmp_artifact"
     echo "build-pocketboot: build produced no boot image" >&2
     exit 1
 }
-mv -f "$tmp_artifact" "$artifact"
 
-hash=$(sha256sum "$artifact")
+profile_parent_hash=
+profile_allowed_ranges=
+profile_changed_spans=
+profile_metadata_hash=
+if [ "$no_acm" -eq 1 ]; then
+    profile_parent_hash=$(python3 "$profile_tool" rewrite-image-no-acm \
+        --image "$tmp_artifact" --metadata "$tmp_profile_metadata")
+    observed_cmdline=$(python3 "$profile_tool" image-cmdline --image "$tmp_artifact")
+    [ "$observed_cmdline" = "$effective_cmdline" ] || {
+        echo "build-pocketboot: rewritten image cmdline differs from profile" >&2
+        exit 1
+    }
+fi
+post_build_tree=$(patchset_worktree_tree "$source_dir" "$POCKETBOOT_REV")
+[ "$post_build_tree" = "$source_tree" ] || {
+    echo "build-pocketboot: build changed the exact patched source tree" >&2
+    exit 1
+}
+
+hash=$(sha256sum "$tmp_artifact")
 hash=${hash%% *}
-printf '%s  %s\n' "$hash" "$(basename -- "$artifact")" >"$artifact.sha256"
+if [ "$no_acm" -eq 1 ]; then
+    profile_parent_observed=$(python3 "$profile_tool" metadata-field \
+        --metadata "$tmp_profile_metadata" --field parent_sha256)
+    [ "$profile_parent_observed" = "$profile_parent_hash" ] || {
+        echo "build-pocketboot: profile parent hash metadata differs" >&2
+        exit 1
+    }
+    profile_base_observed=$(python3 "$profile_tool" metadata-field \
+        --metadata "$tmp_profile_metadata" --field base_cmdline)
+    [ "$profile_base_observed" = "$base_cmdline" ] || {
+        echo "build-pocketboot: built image base cmdline differs from source profile" >&2
+        exit 1
+    }
+    profile_effective_observed=$(python3 "$profile_tool" metadata-field \
+        --metadata "$tmp_profile_metadata" --field effective_cmdline)
+    [ "$profile_effective_observed" = "$effective_cmdline" ] || {
+        echo "build-pocketboot: profile effective cmdline metadata differs" >&2
+        exit 1
+    }
+    profile_result_hash=$(python3 "$profile_tool" metadata-field \
+        --metadata "$tmp_profile_metadata" --field result_sha256)
+    [ "$profile_result_hash" = "$hash" ] || {
+        echo "build-pocketboot: profile result hash differs from artifact" >&2
+        exit 1
+    }
+    profile_allowed_ranges=$(python3 "$profile_tool" metadata-field \
+        --metadata "$tmp_profile_metadata" --field allowed_ranges)
+    profile_changed_spans=$(python3 "$profile_tool" metadata-field \
+        --metadata "$tmp_profile_metadata" --field changed_spans)
+    profile_other_unchanged=$(python3 "$profile_tool" metadata-field \
+        --metadata "$tmp_profile_metadata" --field all_other_bytes_unchanged)
+    [ "$profile_other_unchanged" = true ] || {
+        echo "build-pocketboot: profile lacks non-cmdline identity proof" >&2
+        exit 1
+    }
+    profile_unsealed=$(python3 "$profile_tool" metadata-field \
+        --metadata "$tmp_profile_metadata" --field unsigned_unsealed_assertion)
+    profile_metadata_hash=$(sha256sum "$tmp_profile_metadata")
+    profile_metadata_hash=${profile_metadata_hash%% *}
+fi
+printf '%s  %s\n' "$hash" "$(basename -- "$artifact")" >"$tmp_checksum"
 {
-    printf 'profile=lab\n'
+    printf 'profile=%s\n' "$profile"
     printf 'pocketboot_url=%s\n' "$POCKETBOOT_URL"
     printf 'pocketboot_rev=%s\n' "$POCKETBOOT_REV"
     printf 'pocketboot_patched_tree=%s\n' "$source_tree"
+    printf 'pocketboot_base_patched_tree=%s\n' "$source_tree"
+    printf 'pocketboot_effective_tree=%s\n' "$effective_tree"
+    if [ "$no_acm" -eq 1 ]; then
+        printf 'profile_application=android-v2-header-postprocess\n'
+        printf 'profile_source_delta=none\n'
+        printf 'profile_base_cmdline=%s\n' "$base_cmdline"
+        printf 'profile_effective_cmdline=%s\n' "$effective_cmdline"
+        printf 'profile_parent_sha256=%s\n' "$profile_parent_hash"
+        printf 'profile_result_sha256=%s\n' "$hash"
+        printf 'profile_allowed_ranges=%s\n' "$profile_allowed_ranges"
+        printf 'profile_changed_spans=%s\n' "$profile_changed_spans"
+        printf 'profile_all_other_bytes_unchanged=true\n'
+        printf 'profile_unsigned_unsealed_assertion=%s\n' "$profile_unsealed"
+        printf 'profile_metadata=%s sha256=%s\n' \
+            "$(basename -- "$profile_metadata")" "$profile_metadata_hash"
+    fi
     for patch in "$ROOT"/patches/pocketboot/*.patch; do
         patch_hash=$(sha256sum "$patch")
         patch_hash=${patch_hash%% *}
@@ -172,6 +308,16 @@ printf '%s  %s\n' "$hash" "$(basename -- "$artifact")" >"$artifact.sha256"
     printf 'kernel_rev=%s\n' "$SDM670_KERNEL_REV"
     printf 'sha256=%s\n' "$hash"
     printf 'built_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-} >"$artifact.provenance"
+} >"$tmp_provenance"
 
-printf 'built %s\nsha256 %s\n' "$artifact" "$hash"
+set -- python3 "$bundle_tool" publish \
+    --output-dir "$output_dir" --image-name "$artifact_name" --profile "$profile" \
+    --image-temp "$tmp_artifact" --sha256-temp "$tmp_checksum" \
+    --provenance-temp "$tmp_provenance"
+if [ "$no_acm" -eq 1 ]; then
+    set -- "$@" --profile-temp "$tmp_profile_metadata"
+fi
+"$@" >/dev/null
+python3 "$bundle_tool" verify --manifest "$bundle_manifest" >/dev/null
+
+printf 'built %s\nsha256 %s\nbundle %s\n' "$artifact" "$hash" "$bundle_manifest"

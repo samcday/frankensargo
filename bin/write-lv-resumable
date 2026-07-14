@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage()
+{
+    cat >&2 <<'EOF'
+usage: write-lv-resumable SERIAL SOURCE /dev/mapper/franken-LV EXPECTED_SHA256
+
+Write a 512-byte-aligned filesystem image through PocketBoot ADB in independently
+verified 64 MiB chunks. Existing matching chunks are skipped, so a hub or ADB
+disconnect can be resumed by running the same command again.
+EOF
+    exit 2
+}
+
+die()
+{
+    printf 'write-lv-resumable: %s\n' "$*" >&2
+    exit 1
+}
+
+[[ $# -eq 4 ]] || usage
+serial=$1
+source=$2
+target=$3
+expected=$4
+
+[[ $serial =~ ^[A-Za-z0-9._:-]+$ ]] || die "unsafe serial: $serial"
+[[ -f $source && ! -L $source ]] || die "source is not a regular file: $source"
+[[ $target =~ ^/dev/mapper/franken-[A-Za-z0-9][A-Za-z0-9+_.-]*$ ]] ||
+    die "target is outside the franken mapper namespace: $target"
+[[ $expected =~ ^[0-9a-f]{64}$ ]] || die "expected hash is not canonical SHA-256"
+
+size=$(stat -c %s -- "$source")
+(( size > 0 && size % 512 == 0 )) || die "source size must be positive and 512-byte aligned"
+actual=$(sha256sum -- "$source" | awk '{print $1}')
+[[ $actual == "$expected" ]] || die "source hash mismatch: expected $expected, got $actual"
+
+chunk_bytes=${FRANKENSARGO_WRITE_CHUNK_BYTES:-$((64 * 1024 * 1024))}
+io_bytes=${FRANKENSARGO_WRITE_IO_BYTES:-$((4 * 1024 * 1024))}
+[[ $chunk_bytes =~ ^[0-9]+$ && $io_bytes =~ ^[0-9]+$ ]] ||
+    die "chunk and I/O sizes must be decimal integers"
+(( chunk_bytes > 0 && io_bytes > 0 && io_bytes % 512 == 0 && chunk_bytes % io_bytes == 0 )) ||
+    die "chunk size must be a positive multiple of the 512-byte-aligned I/O size"
+chunks=$(((size + chunk_bytes - 1) / chunk_bytes))
+target_guard="test -b $target && test \"\$(blockdev --getro $target)\" = 0 && test \"\$(blockdev --getsize64 $target)\" -ge $size"
+
+wait_for_adb()
+{
+    while ! adb -s "$serial" get-state >/dev/null 2>&1; do
+        printf 'write-lv-resumable: waiting for %s\n' "$serial" >&2
+        sleep 1
+    done
+}
+
+assert_remote_target()
+{
+    wait_for_adb
+    adb -s "$serial" shell "$target_guard" >/dev/null 2>&1 ||
+        die "target is not a writable block device large enough for the source: $target"
+}
+
+extract_hash()
+{
+    sed -nE 's/^([0-9a-f]{64})  -$/\1/p' | tail -n 1
+}
+
+remote_chunk_hash()
+{
+    local index=$1 offset=$2 count=$3 output hash
+
+    wait_for_adb
+    if (( count == chunk_bytes )); then
+        output=$(adb -s "$serial" shell \
+            "$target_guard && dd if=$target bs=$io_bytes skip=$((offset / io_bytes)) count=$((chunk_bytes / io_bytes)) 2>/dev/null | sha256sum" \
+            2>/dev/null) || :
+    else
+        output=$(adb -s "$serial" shell \
+            "$target_guard && dd if=$target bs=512 skip=$((offset / 512)) count=$((count / 512)) 2>/dev/null | sha256sum" \
+            2>/dev/null) || :
+    fi
+    hash=$(printf '%s\n' "$output" | extract_hash)
+    [[ -n $hash ]] && printf '%s\n' "$hash"
+}
+
+assert_remote_target
+
+for ((index = 0; index < chunks; index++)); do
+    offset=$((index * chunk_bytes))
+    count=$chunk_bytes
+    if (( offset + count > size )); then
+        count=$((size - offset))
+    fi
+
+    source_hash=$(dd if="$source" bs="$io_bytes" skip=$((offset / io_bytes)) \
+        count=$((chunk_bytes / io_bytes)) status=none | sha256sum | awk '{print $1}')
+    target_hash=$(remote_chunk_hash "$index" "$offset" "$count" || :)
+    if [[ $target_hash == "$source_hash" ]]; then
+        printf 'chunk %d/%d already verified %s\n' "$((index + 1))" "$chunks" "$source_hash"
+        continue
+    fi
+
+    verified=no
+    for attempt in $(seq 1 20); do
+        printf 'chunk %d/%d write attempt %d\n' "$((index + 1))" "$chunks" "$attempt"
+        assert_remote_target
+        set +e
+        dd if="$source" bs="$io_bytes" skip=$((offset / io_bytes)) \
+            count=$((chunk_bytes / io_bytes)) status=none |
+            adb -s "$serial" shell \
+                "$target_guard && exec dd of=$target bs=$io_bytes seek=$((offset / io_bytes))" \
+                >/dev/null 2>&1
+        set -e
+
+        target_hash=$(remote_chunk_hash "$index" "$offset" "$count" || :)
+        if [[ $target_hash == "$source_hash" ]]; then
+            printf 'chunk %d/%d verified %s\n' "$((index + 1))" "$chunks" "$source_hash"
+            verified=yes
+            break
+        fi
+        printf 'write-lv-resumable: chunk %d hash mismatch after attempt %d\n' \
+            "$((index + 1))" "$attempt" >&2
+    done
+    [[ $verified == yes ]] || die "could not verify chunk $((index + 1)) after 20 attempts"
+done
+
+wait_for_adb
+adb -s "$serial" shell sync >/dev/null 2>&1 ||
+    die "remote sync failed; rerun the same command to verify and sync"
+printf 'write-lv-resumable: all %d chunks verified; source sha256 %s\n' "$chunks" "$expected"

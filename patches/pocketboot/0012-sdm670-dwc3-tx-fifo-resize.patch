@@ -1,0 +1,11 @@
+diff --git a/configs/dt-overlays/qcom/sdm670-google-sargo.dtso b/configs/dt-overlays/qcom/sdm670-google-sargo.dtso
+new file mode 100644
+--- /dev/null
++++ b/configs/dt-overlays/qcom/sdm670-google-sargo.dtso
+@@ -0,0 +1,6 @@
++/dts-v1/;
++/plugin/;
++
++&{/soc@0/usb@a6f8800/usb@a600000} {
++	tx-fifo-resize;
++};

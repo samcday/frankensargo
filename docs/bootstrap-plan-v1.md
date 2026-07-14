@@ -39,7 +39,8 @@ Before emitting a plan it independently checks:
 - `sargo`, `google,sargo`, explicit fastboot serial and eMMC CID;
 - the observed all-zero GPT disk GUID, primary/backup header hashes, aliased
   backup-entry layout and entry-array hash;
-- exactly one `userdata` entry selected by the supplied PARTUUID;
+- exactly one `userdata` entry selected by the supplied PARTUUID, observed as
+  the fixed sargo target `mmcblk0p72`;
 - GPT type, start LBA, sector count, 512-byte sector size and exact
   53,648,801,280-byte geometry;
 - the PBREAD1 manifest checksum and its complete identity/geometry binding;

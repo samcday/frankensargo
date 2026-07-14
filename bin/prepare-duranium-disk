@@ -1,0 +1,1152 @@
+#!/usr/bin/env python3
+"""Derive a Duranium whole-disk image with an outer-LVM boot adapter."""
+
+from __future__ import annotations
+
+import argparse
+import binascii
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+
+FORMAT = "frankensargo.duranium-derived-disk.v1"
+SECTOR_BYTES = 512
+EFI_SYSTEM_GUID = uuid.UUID("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
+ARM64_PE_MACHINE = 0xAA64
+PE32_PLUS_MAGIC = 0x20B
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+UKI_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9+_.-]*\.efi\Z")
+FIXED_EPOCH = 315532800  # 1980-01-01 00:00:00 UTC, FAT's epoch.
+MAX_INPUT_BYTES = 256 * 1024 * 1024
+MAX_GPT_ARRAY_BYTES = 16 * 1024 * 1024
+ADAPTER_ESP_PATH = "/EFI/Linux/frankensargo-duranium-lvm-26070701.cpio"
+BLS_ESP_PATH = "/loader/entries/frankensargo-duranium.conf"
+LOADER_ESP_PATH = "/loader/loader.conf"
+BLS_ID = "frankensargo-duranium.conf"
+
+
+class ToolError(Exception):
+    pass
+
+
+def fail(message: str) -> "None":
+    raise ToolError(message)
+
+
+def checked_sha(kind: str, value: str) -> str:
+    if not SHA256_RE.fullmatch(value):
+        fail(f"invalid {kind} SHA-256: {value}")
+    return value
+
+
+def checked_uuid(kind: str, value: str) -> uuid.UUID:
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        fail(f"invalid {kind}: {value}")
+    if value != str(parsed):
+        fail(f"{kind} must use canonical lowercase form: {parsed}")
+    return parsed
+
+
+def checked_positive(kind: str, value: int) -> int:
+    if value <= 0:
+        fail(f"{kind} must be positive")
+    return value
+
+
+@dataclass
+class OpenInput:
+    kind: str
+    path: Path
+    fd: int
+    size: int
+    sha256: str
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+
+def open_input(kind: str, path_arg: str, expected_sha: str, maximum: int | None = None) -> OpenInput:
+    path = Path(path_arg).expanduser()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        fail(f"cannot open {kind} without following a final symlink: {path}: {error}")
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            fail(f"{kind} is not a regular file: {path}")
+        if maximum is not None and metadata.st_size > maximum:
+            fail(f"{kind} is {metadata.st_size} bytes, exceeding the {maximum}-byte limit")
+        actual = hash_fd(fd)
+        if actual != expected_sha:
+            fail(f"{kind} SHA-256 mismatch: expected {expected_sha}, got {actual}")
+        os.lseek(fd, 0, os.SEEK_SET)
+        return OpenInput(kind, path, fd, metadata.st_size, actual)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def hash_fd(fd: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        block = os.read(fd, 1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    return digest.hexdigest()
+
+
+def read_input(item: OpenInput) -> bytes:
+    os.lseek(item.fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = item.size
+    while remaining:
+        chunk = os.read(item.fd, min(1024 * 1024, remaining))
+        if not chunk:
+            fail(f"{item.kind} changed while reading")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(item.fd, 1):
+        fail(f"{item.kind} grew while reading")
+    return b"".join(chunks)
+
+
+def output_path(kind: str, path_arg: str) -> Path:
+    supplied = Path(path_arg).expanduser()
+    if supplied.name in ("", ".", ".."):
+        fail(f"invalid {kind} path: {supplied}")
+    try:
+        parent = supplied.parent.resolve(strict=True)
+    except OSError as error:
+        fail(f"cannot resolve {kind} parent {supplied.parent}: {error}")
+    if not parent.is_dir():
+        fail(f"{kind} parent is not a directory: {parent}")
+    path = parent / supplied.name
+    if os.path.lexists(path):
+        fail(f"{kind} exists; refusing to replace it: {path}")
+    return path
+
+
+def write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            fail("short write while constructing output")
+        view = view[written:]
+
+
+class RegionHashes:
+    def __init__(self, esp_offset: int, esp_bytes: int):
+        self.full = hashlib.sha256()
+        self.outside_esp = hashlib.sha256()
+        self.esp_offset = esp_offset
+        self.esp_end = esp_offset + esp_bytes
+        self.position = 0
+
+    def update(self, data: bytes) -> None:
+        self.full.update(data)
+        start = self.position
+        end = start + len(data)
+        if start < self.esp_offset:
+            self.outside_esp.update(data[: min(end, self.esp_offset) - start])
+        if end > self.esp_end:
+            self.outside_esp.update(data[max(self.esp_end, start) - start :])
+        self.position = end
+
+
+def copy_raw_stream(
+    stream,
+    output_fd: int,
+    expected_bytes: int,
+    esp_offset: int,
+    esp_bytes: int,
+) -> RegionHashes:
+    hashes = RegionHashes(esp_offset, esp_bytes)
+    while True:
+        block = stream.read(1024 * 1024)
+        if not block:
+            break
+        if hashes.position + len(block) > expected_bytes:
+            fail(f"decompressed/raw source exceeds expected {expected_bytes} bytes")
+        write_all(output_fd, block)
+        hashes.update(block)
+    if hashes.position != expected_bytes:
+        fail(f"decompressed/raw source is {hashes.position} bytes, expected {expected_bytes}")
+    return hashes
+
+
+def materialize_raw(
+    source: OpenInput,
+    source_format: str,
+    output_fd: int,
+    expected_bytes: int,
+    esp_offset: int,
+    esp_bytes: int,
+) -> RegionHashes:
+    os.lseek(source.fd, 0, os.SEEK_SET)
+    if source_format == "raw":
+        with os.fdopen(os.dup(source.fd), "rb", closefd=True) as stream:
+            return copy_raw_stream(stream, output_fd, expected_bytes, esp_offset, esp_bytes)
+
+    zstd = shutil.which("zstd")
+    if zstd is None:
+        fail("zstd is required for --source-format zst (install zstd inside fedora-latest)")
+    process = subprocess.Popen(
+        [zstd, "--decompress", "--stdout", "--no-progress"],
+        stdin=source.fd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    try:
+        hashes = copy_raw_stream(
+            process.stdout, output_fd, expected_bytes, esp_offset, esp_bytes
+        )
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    stderr = process.stderr.read() if process.stderr is not None else b""
+    returncode = process.wait()
+    if returncode != 0:
+        detail = stderr.decode("utf-8", "replace").strip()
+        fail(f"zstd decompression failed ({returncode}): {detail}")
+    return hashes
+
+
+def read_exact_at(fd: int, count: int, offset: int) -> bytes:
+    data = bytearray()
+    while len(data) < count:
+        chunk = os.pread(fd, count - len(data), offset + len(data))
+        if not chunk:
+            fail(f"unexpected EOF at byte {offset + len(data)}")
+        data.extend(chunk)
+    return bytes(data)
+
+
+@dataclass(frozen=True)
+class GptPartition:
+    number: int
+    type_guid: uuid.UUID
+    partuuid: uuid.UUID
+    first_lba: int
+    last_lba: int
+    attributes: int
+    name: str
+
+    def json(self) -> dict[str, object]:
+        return {
+            "number": self.number,
+            "type_guid": str(self.type_guid),
+            "partuuid": str(self.partuuid),
+            "first_lba": self.first_lba,
+            "last_lba": self.last_lba,
+            "sectors": self.last_lba - self.first_lba + 1,
+            "attributes": str(self.attributes),
+            "name": self.name,
+        }
+
+
+@dataclass(frozen=True)
+class Gpt:
+    disk_guid: uuid.UUID
+    disk_lbas: int
+    first_usable_lba: int
+    last_usable_lba: int
+    entry_count: int
+    entry_size: int
+    entry_array_sha256: str
+    partitions: tuple[GptPartition, ...]
+
+    def json(self) -> dict[str, object]:
+        return {
+            "sector_bytes": SECTOR_BYTES,
+            "disk_lbas": self.disk_lbas,
+            "disk_guid": str(self.disk_guid),
+            "first_usable_lba": self.first_usable_lba,
+            "last_usable_lba": self.last_usable_lba,
+            "entry_count": self.entry_count,
+            "entry_size": self.entry_size,
+            "entry_array_sha256": self.entry_array_sha256,
+            "partitions": [partition.json() for partition in self.partitions],
+        }
+
+
+def parse_header(block: bytes, expected_lba: int, kind: str) -> dict[str, object]:
+    if block[:8] != b"EFI PART":
+        fail(f"{kind} GPT signature is absent")
+    revision, header_size, stored_crc, reserved = struct.unpack_from("<IIII", block, 8)
+    if revision != 0x00010000:
+        fail(f"{kind} GPT revision is not 1.0: 0x{revision:08x}")
+    if not 92 <= header_size <= SECTOR_BYTES:
+        fail(f"{kind} GPT header size is invalid: {header_size}")
+    if reserved != 0:
+        fail(f"{kind} GPT reserved field is nonzero")
+    check = bytearray(block[:header_size])
+    struct.pack_into("<I", check, 16, 0)
+    actual_crc = binascii.crc32(check) & 0xFFFFFFFF
+    if actual_crc != stored_crc:
+        fail(
+            f"{kind} GPT header CRC mismatch: stored 0x{stored_crc:08x}, "
+            f"calculated 0x{actual_crc:08x}"
+        )
+    current_lba, backup_lba, first_usable, last_usable = struct.unpack_from("<QQQQ", block, 24)
+    if current_lba != expected_lba:
+        fail(f"{kind} GPT current LBA is {current_lba}, expected {expected_lba}")
+    disk_guid = uuid.UUID(bytes_le=block[56:72])
+    entry_lba, entry_count, entry_size, entry_crc = struct.unpack_from("<QIII", block, 72)
+    return {
+        "backup_lba": backup_lba,
+        "first_usable": first_usable,
+        "last_usable": last_usable,
+        "disk_guid": disk_guid,
+        "entry_lba": entry_lba,
+        "entry_count": entry_count,
+        "entry_size": entry_size,
+        "entry_crc": entry_crc,
+    }
+
+
+def parse_partition_name(raw: bytes, number: int) -> str:
+    try:
+        text = raw.decode("utf-16le")
+    except UnicodeDecodeError:
+        fail(f"GPT partition {number} name is invalid UTF-16LE")
+    if "\0" in text:
+        name, padding = text.split("\0", 1)
+        if padding.strip("\0"):
+            fail(f"GPT partition {number} name has nonzero data after its terminator")
+        return name
+    return text
+
+
+def validate_protective_mbr(fd: int, disk_lbas: int) -> None:
+    mbr = read_exact_at(fd, SECTOR_BYTES, 0)
+    if mbr[510:512] != b"\x55\xaa":
+        fail("protective MBR signature is absent")
+    entries = [mbr[446 + index * 16 : 462 + index * 16] for index in range(4)]
+    protective = [entry for entry in entries if entry[4] == 0xEE]
+    if len(protective) != 1:
+        fail(f"protective MBR has {len(protective)} type-0xee entries, expected one")
+    entry = protective[0]
+    start, sectors = struct.unpack_from("<II", entry, 8)
+    if entry[0] != 0 or start != 1 or sectors != min(disk_lbas - 1, 0xFFFFFFFF):
+        fail("protective MBR geometry is not canonical for this disk")
+    if any(any(other) for other in entries if other is not entry):
+        fail("protective MBR contains an unexpected additional entry")
+
+
+def validate_gpt(fd: int, disk_bytes: int) -> Gpt:
+    if disk_bytes % SECTOR_BYTES:
+        fail(f"disk byte length {disk_bytes} is not divisible by {SECTOR_BYTES}")
+    disk_lbas = disk_bytes // SECTOR_BYTES
+    if disk_lbas < 68:
+        fail("disk is too small for mirrored GPT metadata")
+    validate_protective_mbr(fd, disk_lbas)
+    primary = parse_header(read_exact_at(fd, SECTOR_BYTES, SECTOR_BYTES), 1, "primary")
+    backup_lba = disk_lbas - 1
+    backup = parse_header(
+        read_exact_at(fd, SECTOR_BYTES, backup_lba * SECTOR_BYTES), backup_lba, "backup"
+    )
+    if primary["backup_lba"] != backup_lba or backup["backup_lba"] != 1:
+        fail("primary/backup GPT header pointers do not mirror each other")
+    for field in (
+        "first_usable",
+        "last_usable",
+        "disk_guid",
+        "entry_count",
+        "entry_size",
+        "entry_crc",
+    ):
+        if primary[field] != backup[field]:
+            fail(f"primary/backup GPT {field} values disagree")
+    entry_count = int(primary["entry_count"])
+    entry_size = int(primary["entry_size"])
+    if entry_count <= 0 or entry_size < 128 or entry_size % 8:
+        fail(f"GPT entry geometry is invalid: count={entry_count}, size={entry_size}")
+    array_bytes = entry_count * entry_size
+    if array_bytes > MAX_GPT_ARRAY_BYTES:
+        fail(f"GPT entry array is implausibly large: {array_bytes} bytes")
+    array_lbas = (array_bytes + SECTOR_BYTES - 1) // SECTOR_BYTES
+    if primary["entry_lba"] != 2:
+        fail(f"primary GPT entry array begins at unexpected LBA {primary['entry_lba']}")
+    if backup["entry_lba"] != backup_lba - array_lbas:
+        fail(f"backup GPT entry array begins at unexpected LBA {backup['entry_lba']}")
+    if primary["first_usable"] < 2 + array_lbas:
+        fail("first usable GPT LBA overlaps the primary entry array")
+    if primary["last_usable"] >= backup["entry_lba"]:
+        fail("last usable GPT LBA overlaps the backup entry array")
+    primary_array = read_exact_at(fd, array_bytes, int(primary["entry_lba"]) * SECTOR_BYTES)
+    backup_array = read_exact_at(fd, array_bytes, int(backup["entry_lba"]) * SECTOR_BYTES)
+    if primary_array != backup_array:
+        fail("primary and backup GPT entry arrays differ")
+    actual_crc = binascii.crc32(primary_array) & 0xFFFFFFFF
+    if actual_crc != primary["entry_crc"]:
+        fail(
+            f"GPT entry-array CRC mismatch: stored 0x{int(primary['entry_crc']):08x}, "
+            f"calculated 0x{actual_crc:08x}"
+        )
+
+    partitions: list[GptPartition] = []
+    seen_partuuids: set[uuid.UUID] = set()
+    for index in range(entry_count):
+        entry = primary_array[index * entry_size : (index + 1) * entry_size]
+        type_guid = uuid.UUID(bytes_le=entry[:16])
+        if type_guid.int == 0:
+            if any(entry):
+                fail(f"unused GPT partition entry {index + 1} contains nonzero data")
+            continue
+        partuuid = uuid.UUID(bytes_le=entry[16:32])
+        first_lba, last_lba, attributes = struct.unpack_from("<QQQ", entry, 32)
+        if partuuid.int == 0 or partuuid in seen_partuuids:
+            fail(f"GPT partition {index + 1} has a zero or duplicate PARTUUID")
+        seen_partuuids.add(partuuid)
+        if not int(primary["first_usable"]) <= first_lba <= last_lba <= int(
+            primary["last_usable"]
+        ):
+            fail(f"GPT partition {index + 1} lies outside the usable range")
+        partitions.append(
+            GptPartition(
+                index + 1,
+                type_guid,
+                partuuid,
+                first_lba,
+                last_lba,
+                attributes,
+                parse_partition_name(entry[56:128], index + 1),
+            )
+        )
+    for left, right in zip(
+        sorted(partitions, key=lambda partition: partition.first_lba),
+        sorted(partitions, key=lambda partition: partition.first_lba)[1:],
+    ):
+        if left.last_lba >= right.first_lba:
+            fail(f"GPT partitions {left.number} and {right.number} overlap")
+    return Gpt(
+        uuid.UUID(str(primary["disk_guid"])),
+        disk_lbas,
+        int(primary["first_usable"]),
+        int(primary["last_usable"]),
+        entry_count,
+        entry_size,
+        hashlib.sha256(primary_array).hexdigest(),
+        tuple(partitions),
+    )
+
+
+def select_esp(
+    gpt: Gpt,
+    expected_disk_guid: uuid.UUID,
+    expected_partuuid: uuid.UUID,
+    expected_start: int,
+    expected_sectors: int,
+) -> GptPartition:
+    if gpt.disk_guid != expected_disk_guid:
+        fail(f"GPT disk GUID mismatch: expected {expected_disk_guid}, got {gpt.disk_guid}")
+    candidates = [partition for partition in gpt.partitions if partition.type_guid == EFI_SYSTEM_GUID]
+    if len(candidates) != 1:
+        fail(f"GPT contains {len(candidates)} EFI System Partitions, expected exactly one")
+    esp = candidates[0]
+    if esp.partuuid != expected_partuuid:
+        fail(f"ESP PARTUUID mismatch: expected {expected_partuuid}, got {esp.partuuid}")
+    if esp.first_lba != expected_start:
+        fail(f"ESP start-LBA mismatch: expected {expected_start}, got {esp.first_lba}")
+    sectors = esp.last_lba - esp.first_lba + 1
+    if sectors != expected_sectors:
+        fail(f"ESP sector-count mismatch: expected {expected_sectors}, got {sectors}")
+    if esp.name != "esp":
+        fail(f"ESP GPT name is {esp.name!r}, expected 'esp'")
+    return esp
+
+
+def validate_fat32(fd: int, esp: GptPartition) -> dict[str, object]:
+    offset = esp.first_lba * SECTOR_BYTES
+    esp_sectors = esp.last_lba - esp.first_lba + 1
+    boot = read_exact_at(fd, SECTOR_BYTES, offset)
+    if boot[510:512] != b"\x55\xaa":
+        fail("ESP FAT boot-sector signature is absent")
+    bytes_per_sector = struct.unpack_from("<H", boot, 11)[0]
+    sectors_per_cluster = boot[13]
+    reserved = struct.unpack_from("<H", boot, 14)[0]
+    fats = boot[16]
+    root_entries = struct.unpack_from("<H", boot, 17)[0]
+    total16 = struct.unpack_from("<H", boot, 19)[0]
+    fat16 = struct.unpack_from("<H", boot, 22)[0]
+    hidden = struct.unpack_from("<I", boot, 28)[0]
+    total32 = struct.unpack_from("<I", boot, 32)[0]
+    fat32 = struct.unpack_from("<I", boot, 36)[0]
+    root_cluster = struct.unpack_from("<I", boot, 44)[0]
+    fsinfo_sector = struct.unpack_from("<H", boot, 48)[0]
+    backup_sector = struct.unpack_from("<H", boot, 50)[0]
+    if bytes_per_sector != SECTOR_BYTES:
+        fail(f"ESP FAT sector size is {bytes_per_sector}, expected {SECTOR_BYTES}")
+    if sectors_per_cluster == 0 or sectors_per_cluster > 128 or sectors_per_cluster & (
+        sectors_per_cluster - 1
+    ):
+        fail(f"ESP FAT sectors-per-cluster is invalid: {sectors_per_cluster}")
+    if reserved < 2 or fats not in (1, 2):
+        fail(f"ESP FAT reserved/FAT counts are invalid: reserved={reserved}, fats={fats}")
+    if root_entries != 0 or total16 != 0 or fat16 != 0 or fat32 == 0 or root_cluster < 2:
+        fail("ESP is not an internally consistent FAT32 filesystem")
+    total = total32
+    if total == 0 or total > esp_sectors:
+        fail(f"ESP FAT spans {total} sectors but GPT grants {esp_sectors}")
+    first_data = reserved + fats * fat32
+    if first_data >= total:
+        fail("ESP FAT tables consume the whole filesystem")
+    clusters = (total - first_data) // sectors_per_cluster
+    if clusters < 65525:
+        fail(f"ESP FAT32 data region has too few clusters: {clusters}")
+    if not 0 < fsinfo_sector < reserved or not 0 < backup_sector < reserved:
+        fail("ESP FAT32 FSInfo/backup sectors lie outside the reserved region")
+    fsinfo = read_exact_at(fd, SECTOR_BYTES, offset + fsinfo_sector * SECTOR_BYTES)
+    if (
+        fsinfo[:4] != b"RRaA"
+        or fsinfo[484:488] != b"rrAa"
+        or fsinfo[508:512] != b"\x00\x00\x55\xaa"
+    ):
+        fail("ESP FAT32 FSInfo signatures are invalid")
+    backup = read_exact_at(fd, SECTOR_BYTES, offset + backup_sector * SECTOR_BYTES)
+    if backup[:90] != boot[:90] or backup[510:512] != b"\x55\xaa":
+        fail("ESP FAT32 backup boot sector disagrees with the primary")
+    return {
+        "type": "fat32",
+        "offset_bytes": offset,
+        "partition_bytes": esp_sectors * SECTOR_BYTES,
+        "filesystem_sectors": total,
+        "filesystem_bytes": total * SECTOR_BYTES,
+        "trailing_partition_slack_bytes": (esp_sectors - total) * SECTOR_BYTES,
+        "sectors_per_cluster": sectors_per_cluster,
+        "hidden_sectors": hidden,
+        "volume_id": f"{struct.unpack_from('<I', boot, 67)[0]:08x}",
+    }
+
+
+def pe_sections(data: bytes) -> list[tuple[str, bytes]]:
+    if len(data) < 64 or data[:2] != b"MZ":
+        fail("published UKI lacks an MZ header")
+    pe_offset = struct.unpack_from("<I", data, 60)[0]
+    if pe_offset > len(data) - 24 or data[pe_offset : pe_offset + 4] != b"PE\0\0":
+        fail("published UKI lacks a bounded PE/COFF header")
+    machine, count = struct.unpack_from("<HH", data, pe_offset + 4)
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    if machine != ARM64_PE_MACHINE:
+        fail(f"published UKI PE machine is 0x{machine:04x}, expected AArch64")
+    if count == 0 or count > 512:
+        fail(f"published UKI section count is invalid: {count}")
+    optional = pe_offset + 24
+    if optional_size < 2 or optional + optional_size > len(data):
+        fail("published UKI optional header is out of bounds")
+    if struct.unpack_from("<H", data, optional)[0] != PE32_PLUS_MAGIC:
+        fail("published UKI is not PE32+")
+    table = optional + optional_size
+    if table + count * 40 > len(data):
+        fail("published UKI section table is out of bounds")
+    result: list[tuple[str, bytes]] = []
+    for index in range(count):
+        header = data[table + index * 40 : table + (index + 1) * 40]
+        raw_name = header[:8].rstrip(b"\0")
+        try:
+            name = raw_name.decode("ascii")
+        except UnicodeDecodeError:
+            fail(f"published UKI section {index} has a non-ASCII name")
+        virtual_size, raw_size, raw_offset = struct.unpack_from("<I4xII", header, 8)
+        logical_size = min(virtual_size, raw_size)
+        if raw_offset > len(data) or logical_size > len(data) - raw_offset:
+            fail(f"published UKI section {name!r} lies outside the file")
+        result.append((name, data[raw_offset : raw_offset + logical_size]))
+    return result
+
+
+def embedded_cmdline(uki: bytes, expected_sha: str) -> tuple[str, str]:
+    sections = pe_sections(uki)
+    first_profile = next(
+        (index for index, (name, _) in enumerate(sections) if name == ".profile"), len(sections)
+    )
+    base = sections[:first_profile]
+    cmdlines = [contents for name, contents in base if name == ".cmdline"]
+    if len(cmdlines) != 1:
+        fail(f"published UKI base profile has {len(cmdlines)} .cmdline sections, expected one")
+    for required in (".linux", ".initrd"):
+        if not any(name == required and contents for name, contents in base):
+            fail(f"published UKI base profile lacks a nonempty {required} section")
+    raw = cmdlines[0]
+    stripped = raw.rstrip(b"\0")
+    if not stripped or b"\0" in stripped:
+        fail("published UKI base .cmdline is empty or contains an interior NUL")
+    if any(byte < 0x20 or byte > 0x7E for byte in stripped):
+        fail("published UKI base .cmdline is not printable ASCII")
+    text = stripped.decode("ascii")
+    if text != text.strip() or "  " in text:
+        fail("published UKI base .cmdline has non-canonical whitespace")
+    actual = hashlib.sha256(stripped).hexdigest()
+    if actual != expected_sha:
+        fail(f"embedded cmdline SHA-256 mismatch: expected {expected_sha}, got {actual}")
+    tokens = text.split(" ")
+    if len([token for token in tokens if re.fullmatch(r"usrhash=[0-9a-f]{64}", token)]) != 1:
+        fail("published UKI base .cmdline lacks exactly one canonical usrhash=")
+    if any(token.startswith("root=") or token.startswith("mount.usr=") for token in tokens):
+        fail("published UKI base .cmdline already contains a root=/mount.usr= directive")
+    return text, hashlib.sha256(raw).hexdigest()
+
+
+def validate_adapter(data: bytes) -> dict[str, object]:
+    offset = 0
+    names: set[str] = set()
+    manifest: dict[str, object] | None = None
+    manifest_sha256: str | None = None
+    while True:
+        if offset + 110 > len(data) or data[offset : offset + 6] != b"070701":
+            fail(f"adapter is not a bounded newc archive at byte {offset}")
+        try:
+            fields = [
+                int(data[offset + 6 + index * 8 : offset + 14 + index * 8], 16)
+                for index in range(13)
+            ]
+        except ValueError:
+            fail(f"adapter has invalid newc metadata at byte {offset}")
+        offset += 110
+        size, namesize = fields[6], fields[11]
+        if namesize < 2 or offset + namesize > len(data):
+            fail("adapter has an invalid newc pathname length")
+        raw_name = data[offset : offset + namesize]
+        if not raw_name.endswith(b"\0"):
+            fail("adapter has a non-NUL-terminated newc pathname")
+        try:
+            name = raw_name[:-1].decode("utf-8")
+        except UnicodeDecodeError:
+            fail("adapter has a non-UTF-8 newc pathname")
+        offset += namesize
+        offset += -offset % 4
+        if offset + size > len(data):
+            fail(f"adapter newc payload for {name!r} lies outside the file")
+        contents = data[offset : offset + size]
+        offset += size
+        offset += -offset % 4
+        if name == "TRAILER!!!":
+            if size != 0:
+                fail("adapter newc trailer is nonempty")
+            break
+        path = Path(name)
+        components = name.split("/")
+        if (
+            path.is_absolute()
+            or not path.parts
+            or any(part in ("", ".", "..") for part in components)
+        ):
+            fail(f"adapter has an unsafe newc pathname: {name!r}")
+        if name in names:
+            fail(f"adapter has a duplicate newc pathname: {name!r}")
+        names.add(name)
+        if name == "usr/lib/frankensargo-duranium/build-manifest.json":
+            try:
+                manifest = json.loads(contents)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                fail("adapter build manifest is not valid UTF-8 JSON")
+            manifest_sha256 = hashlib.sha256(contents).hexdigest()
+    if any(data[offset:]):
+        fail("adapter has nonzero bytes after its newc trailer")
+    if "init" not in names:
+        fail("adapter archive lacks its init override")
+    if not isinstance(manifest, dict) or manifest.get("format") != "frankensargo.duranium-lvm-adapter.v1":
+        fail("adapter archive lacks the expected build-manifest format")
+    return {
+        "format": manifest["format"],
+        "entry_count": len(names),
+        "build_manifest_sha256": manifest_sha256,
+    }
+
+
+def render_bls(uki_name: str, cmdline: str) -> bytes:
+    tokens = cmdline.split(" ")
+    sysrq = "sysrq_always_enabled=1"
+    if tokens.count(sysrq) > 1:
+        fail("published UKI base .cmdline contains duplicate sysrq_always_enabled=1")
+    required = ["root=dissect", "mount.usr=dissect"]
+    if sysrq not in tokens:
+        required.append(sysrq)
+    options = " ".join([cmdline, *required])
+    return (
+        "title Duranium 26070701 (frankensargo LVM)\n"
+        "version 26070701\n"
+        "architecture aa64\n"
+        f"uki /EFI/Linux/{uki_name}\n"
+        "profile 0\n"
+        f"initrd {ADAPTER_ESP_PATH}\n"
+        f"options {options}\n"
+    ).encode("ascii")
+
+
+def render_loader(original: bytes) -> bytes:
+    if len(original) > 64 * 1024:
+        fail("published loader.conf exceeds the 64-KiB policy limit")
+    try:
+        text = original.decode("ascii")
+    except UnicodeDecodeError:
+        fail("published loader.conf is not ASCII")
+    if "\0" in text or "\r" in text or (text and not text.endswith("\n")):
+        fail("published loader.conf has non-canonical text framing")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.split(None, 1)[0].lower() == "default":
+            fail("published loader.conf already has an active default directive")
+    return original + f"default {BLS_ID}\n".encode("ascii")
+
+
+def mtools_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for key in list(environment):
+        if key.startswith("MTOOLS_"):
+            del environment[key]
+    environment.update(
+        {
+            "LC_ALL": "C",
+            "TZ": "UTC",
+            "SOURCE_DATE_EPOCH": str(FIXED_EPOCH),
+            "MTOOLSRC": "/dev/null",
+            "MTOOLS_SKIP_CHECK": "0",
+            "MTOOLS_NO_VFAT": "0",
+            "MTOOLS_NAME_NUMERIC_TAIL": "1",
+        }
+    )
+    return environment
+
+
+def required_mtool(name: str) -> str:
+    path = shutil.which(name)
+    if path is None:
+        fail(f"required command {name} is absent (install mtools inside fedora-latest)")
+    # mtools normally installs command-name symlinks to one multicall binary;
+    # preserving argv[0] is how that binary selects mcopy versus mdir.
+    return os.path.abspath(path)
+
+
+def run_mtool(
+    executable: str,
+    arguments: list[str],
+    environment: dict[str, str],
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        [executable, *arguments],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        fail(f"{Path(executable).name} failed ({result.returncode}): {detail}")
+    return result
+
+
+def stage_file(root: Path, name: str, data: bytes) -> Path:
+    path = root / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    try:
+        write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.utime(path, (FIXED_EPOCH, FIXED_EPOCH), follow_symlinks=False)
+    return path
+
+
+def extract_esp_file(
+    mcopy: str,
+    image_spec: str,
+    esp_path: str,
+    scratch: Path,
+    environment: dict[str, str],
+    required: bool = True,
+) -> bytes | None:
+    destination = scratch / f"extract-{len(list(scratch.iterdir()))}"
+    result = run_mtool(
+        mcopy,
+        ["-i", image_spec, esp_path.replace("/", "::/", 1), str(destination)],
+        environment,
+        check=False,
+    )
+    if result.returncode != 0:
+        if required:
+            detail = (result.stderr or result.stdout).strip()
+            fail(f"cannot extract ESP file {esp_path}: {detail}")
+        return None
+    try:
+        metadata = destination.lstat()
+    except OSError as error:
+        fail(f"mcopy reported success without an output for {esp_path}: {error}")
+    if not stat.S_ISREG(metadata.st_mode):
+        fail(f"ESP path {esp_path} did not extract as a regular file")
+    return destination.read_bytes()
+
+
+def inject_esp(
+    image_path: Path,
+    esp_offset: int,
+    uki_name: str,
+    uki: bytes,
+    adapter: bytes,
+    bls: bytes,
+) -> tuple[dict[str, object], dict[str, bytes]]:
+    mcopy = required_mtool("mcopy")
+    mdir = required_mtool("mdir")
+    environment = mtools_environment()
+    version = run_mtool(mcopy, ["--version"], environment).stdout.splitlines()[0].strip()
+    image_spec = f"{image_path}@@{esp_offset}"
+    with tempfile.TemporaryDirectory(prefix="frankensargo-esp-") as temporary:
+        scratch = Path(temporary)
+        for directory in ("::/EFI/Linux", "::/loader", "::/loader/entries"):
+            run_mtool(mdir, ["-i", image_spec, directory], environment)
+        esp_uki_path = f"/EFI/Linux/{uki_name}"
+        existing_uki = extract_esp_file(
+            mcopy, image_spec, esp_uki_path, scratch, environment, required=True
+        )
+        assert existing_uki is not None
+        if existing_uki != uki:
+            fail(
+                f"ESP UKI {esp_uki_path} does not byte-match the pinned published UKI "
+                f"(got {hashlib.sha256(existing_uki).hexdigest()})"
+            )
+        for target in (ADAPTER_ESP_PATH, BLS_ESP_PATH):
+            if extract_esp_file(mcopy, image_spec, target, scratch, environment, required=False) is not None:
+                fail(f"ESP target already exists; refusing to replace it: {target}")
+        original_loader = extract_esp_file(
+            mcopy, image_spec, LOADER_ESP_PATH, scratch, environment, required=True
+        )
+        assert original_loader is not None
+        loader = render_loader(original_loader)
+
+        staged = {
+            ADAPTER_ESP_PATH: stage_file(scratch, "adapter.cpio", adapter),
+            BLS_ESP_PATH: stage_file(scratch, "entry.conf", bls),
+            LOADER_ESP_PATH: stage_file(scratch, "loader.conf", loader),
+        }
+        for target in (ADAPTER_ESP_PATH, BLS_ESP_PATH):
+            run_mtool(
+                mcopy,
+                [
+                    "-m",
+                    "-D",
+                    "s",
+                    "-i",
+                    image_spec,
+                    str(staged[target]),
+                    target.replace("/", "::/", 1),
+                ],
+                environment,
+            )
+        run_mtool(
+            mcopy,
+            [
+                "-m",
+                "-D",
+                "o",
+                "-i",
+                image_spec,
+                str(staged[LOADER_ESP_PATH]),
+                LOADER_ESP_PATH.replace("/", "::/", 1),
+            ],
+            environment,
+        )
+
+        expected = {
+            esp_uki_path: uki,
+            ADAPTER_ESP_PATH: adapter,
+            BLS_ESP_PATH: bls,
+            LOADER_ESP_PATH: loader,
+        }
+        for target, contents in expected.items():
+            extracted = extract_esp_file(
+                mcopy, image_spec, target, scratch, environment, required=True
+            )
+            if extracted != contents:
+                fail(
+                    f"post-write ESP verification failed for {target}: expected "
+                    f"{hashlib.sha256(contents).hexdigest()}, got "
+                    f"{hashlib.sha256(extracted or b'').hexdigest()}"
+                )
+        return (
+            {
+                "implementation": version,
+                "source_date_epoch": str(FIXED_EPOCH),
+                "configuration": "MTOOLSRC=/dev/null, sanity checks enabled",
+            },
+            {"original_loader": original_loader, **expected},
+        )
+
+
+def hash_disk(path: Path, esp_offset: int, esp_bytes: int) -> RegionHashes:
+    hashes = RegionHashes(esp_offset, esp_bytes)
+    with path.open("rb", buffering=0) as stream:
+        while True:
+            block = stream.read(1024 * 1024)
+            if not block:
+                break
+            hashes.update(block)
+    return hashes
+
+
+def publish_temp(temp_path: Path, final_path: Path) -> None:
+    if os.path.lexists(final_path):
+        fail(f"destination appeared during the build; refusing to replace it: {final_path}")
+    try:
+        os.link(temp_path, final_path, follow_symlinks=False)
+    except OSError as error:
+        fail(f"cannot publish {final_path} without replacement: {error}")
+    temp_path.unlink()
+
+
+def write_provenance(path: Path, provenance: dict[str, object]) -> None:
+    data = (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode()
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(temporary)
+    try:
+        os.fchmod(fd, 0o644)
+        write_all(fd, data)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        publish_temp(temp_path, path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temp_path.unlink(missing_ok=True)
+
+
+def build(args: argparse.Namespace) -> dict[str, object]:
+    source_sha = checked_sha("source artifact", args.source_sha256)
+    raw_sha = checked_sha("decompressed raw", args.raw_sha256)
+    uki_sha = checked_sha("published UKI", args.uki_sha256)
+    cmdline_sha = checked_sha("embedded cmdline", args.cmdline_sha256)
+    adapter_sha = checked_sha("adapter", args.adapter_sha256)
+    disk_guid = checked_uuid("disk GUID", args.disk_guid)
+    esp_partuuid = checked_uuid("ESP PARTUUID", args.esp_partuuid)
+    disk_bytes = checked_positive("disk bytes", args.disk_bytes)
+    esp_start = checked_positive("ESP start LBA", args.esp_start_lba)
+    esp_sectors = checked_positive("ESP sectors", args.esp_sectors)
+    esp_offset = esp_start * SECTOR_BYTES
+    esp_bytes = esp_sectors * SECTOR_BYTES
+    if esp_offset + esp_bytes > disk_bytes:
+        fail("expected ESP geometry lies beyond the expected disk length")
+
+    output = output_path("output", args.output)
+    provenance_path = output_path("provenance", args.provenance)
+    if output == provenance_path:
+        fail("output and provenance paths are identical")
+
+    source = open_input("source artifact", args.source, source_sha)
+    uki_input = open_input("published UKI", args.uki, uki_sha, MAX_INPUT_BYTES)
+    adapter_input = open_input("adapter", args.adapter, adapter_sha, MAX_INPUT_BYTES)
+    inputs = (source, uki_input, adapter_input)
+    try:
+        identities = [(os.fstat(item.fd).st_dev, os.fstat(item.fd).st_ino) for item in inputs]
+        if len(set(identities)) != len(identities):
+            fail("source, published UKI, and adapter must be distinct regular files")
+        uki = read_input(uki_input)
+        adapter = read_input(adapter_input)
+        if not UKI_NAME_RE.fullmatch(uki_input.path.name):
+            fail(f"published UKI basename is unsafe for the ESP: {uki_input.path.name!r}")
+        cmdline, cmdline_section_sha = embedded_cmdline(uki, cmdline_sha)
+        adapter_manifest = validate_adapter(adapter)
+        bls = render_bls(uki_input.path.name, cmdline)
+
+        temp_fd, temporary = tempfile.mkstemp(
+            prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+        )
+        temp_path = Path(temporary)
+        published = False
+        try:
+            os.fchmod(temp_fd, 0o644)
+            original_hashes = materialize_raw(
+                source,
+                args.source_format,
+                temp_fd,
+                disk_bytes,
+                esp_offset,
+                esp_bytes,
+            )
+            if original_hashes.full.hexdigest() != raw_sha:
+                fail(
+                    f"decompressed raw SHA-256 mismatch: expected {raw_sha}, got "
+                    f"{original_hashes.full.hexdigest()}"
+                )
+            os.fsync(temp_fd)
+            gpt = validate_gpt(temp_fd, disk_bytes)
+            esp = select_esp(gpt, disk_guid, esp_partuuid, esp_start, esp_sectors)
+            fat = validate_fat32(temp_fd, esp)
+            os.close(temp_fd)
+            temp_fd = -1
+
+            mtools, contents = inject_esp(
+                temp_path, esp_offset, uki_input.path.name, uki, adapter, bls
+            )
+            with temp_path.open("rb", buffering=0) as file:
+                os.fsync(file.fileno())
+                if os.fstat(file.fileno()).st_size != disk_bytes:
+                    fail("mtools changed the derived disk byte length")
+                post_gpt = validate_gpt(file.fileno(), disk_bytes)
+                post_esp = select_esp(
+                    post_gpt, disk_guid, esp_partuuid, esp_start, esp_sectors
+                )
+                post_fat = validate_fat32(file.fileno(), post_esp)
+            if post_gpt != gpt or post_fat != fat:
+                fail("mtools changed GPT or FAT geometry while injecting files")
+            derived_hashes = hash_disk(temp_path, esp_offset, esp_bytes)
+            if derived_hashes.position != disk_bytes:
+                fail(f"derived disk is {derived_hashes.position} bytes, expected {disk_bytes}")
+            if derived_hashes.outside_esp.hexdigest() != original_hashes.outside_esp.hexdigest():
+                fail("bytes outside the exact ESP changed during derivation")
+            for item in inputs:
+                if os.fstat(item.fd).st_size != item.size or hash_fd(item.fd) != item.sha256:
+                    fail(f"{item.kind} changed while the derivation was running")
+
+            injected = []
+            for path, data in contents.items():
+                if path == "original_loader":
+                    continue
+                injected.append(
+                    {"path": path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                )
+            provenance: dict[str, object] = {
+                "format": FORMAT,
+                "inputs": {
+                    "source_artifact": {
+                        "basename": source.path.name,
+                        "format": args.source_format,
+                        "bytes": source.size,
+                        "sha256": source.sha256,
+                    },
+                    "raw_disk": {"bytes": disk_bytes, "sha256": raw_sha},
+                    "published_uki": {
+                        "basename": uki_input.path.name,
+                        "bytes": uki_input.size,
+                        "sha256": uki_input.sha256,
+                        "esp_path": f"/EFI/Linux/{uki_input.path.name}",
+                        "embedded_cmdline": cmdline,
+                        "embedded_cmdline_sha256": cmdline_sha,
+                        "embedded_cmdline_section_sha256": cmdline_section_sha,
+                    },
+                    "adapter": {
+                        "basename": adapter_input.path.name,
+                        "bytes": adapter_input.size,
+                        "sha256": adapter_input.sha256,
+                        **adapter_manifest,
+                    },
+                },
+                "disk": {**gpt.json(), "esp": {**esp.json(), "filesystem": fat}},
+                "derivation": {
+                    "mtools": mtools,
+                    "original_loader_conf_sha256": hashlib.sha256(
+                        contents["original_loader"]
+                    ).hexdigest(),
+                    "bls_id": BLS_ID,
+                    "bls_content": bls.decode("ascii"),
+                    "loader_conf_content": contents[LOADER_ESP_PATH].decode("ascii"),
+                    "injected_files": injected,
+                    "outside_esp_sha256": derived_hashes.outside_esp.hexdigest(),
+                },
+                "requirements": {
+                    "pocketboot": [
+                        "BLS uki payload support",
+                        "BLS external initrd append support",
+                        "loader/loader.conf default selection support",
+                    ],
+                    "duranium_cmdline": [
+                        "root=dissect",
+                        "mount.usr=dissect",
+                        "sysrq_always_enabled=1",
+                    ],
+                    "selection_status": (
+                        "loader default is encoded and verified; PocketBoot parsing and preference "
+                        "are offline-unit-tested, while derived-disk end-to-end hardware selection "
+                        "remains unproved"
+                    ),
+                },
+                "output": {
+                    "basename": output.name,
+                    "bytes": disk_bytes,
+                    "sha256": derived_hashes.full.hexdigest(),
+                },
+            }
+            publish_temp(temp_path, output)
+            published = True
+            try:
+                write_provenance(provenance_path, provenance)
+            except BaseException:
+                output.unlink(missing_ok=True)
+                published = False
+                raise
+            return provenance
+        finally:
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            temp_path.unlink(missing_ok=True)
+            if not published:
+                output.unlink(missing_ok=True)
+                provenance_path.unlink(missing_ok=True)
+    finally:
+        for item in inputs:
+            item.close()
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description=(
+            "Create a new, pinned Duranium whole-disk raw image and inject the "
+            "frankensargo adapter through unprivileged mtools."
+        )
+    )
+    result.add_argument("--source", required=True, help="published .raw or .raw.zst")
+    result.add_argument("--source-format", required=True, choices=("raw", "zst"))
+    result.add_argument("--source-sha256", required=True)
+    result.add_argument("--raw-sha256", required=True, help="decompressed whole-disk SHA-256")
+    result.add_argument("--disk-bytes", required=True, type=int)
+    result.add_argument("--disk-guid", required=True)
+    result.add_argument("--esp-partuuid", required=True)
+    result.add_argument("--esp-start-lba", required=True, type=int)
+    result.add_argument("--esp-sectors", required=True, type=int)
+    result.add_argument("--uki", required=True, help="separately published UKI")
+    result.add_argument("--uki-sha256", required=True)
+    result.add_argument(
+        "--cmdline-sha256",
+        required=True,
+        help="SHA-256 of the base embedded cmdline text, excluding trailing NUL padding",
+    )
+    result.add_argument("--adapter", required=True, help="built Duranium LVM adapter newc")
+    result.add_argument("--adapter-sha256", required=True)
+    result.add_argument("--output", required=True, help="new derived .raw; must not exist")
+    result.add_argument("--provenance", required=True, help="new provenance JSON; must not exist")
+    return result
+
+
+def main() -> int:
+    try:
+        provenance = build(parser().parse_args())
+    except ToolError as error:
+        print(f"prepare-duranium-disk: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(provenance, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
